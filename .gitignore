@@ -1,2 +1,44 @@
-/toyblockchain
-data/chain.json
+# Compiled Go binaries
+toyblockchain
+toyblockchain.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build and test files
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Runtime blockchain and wallet data
+data/*.json
+data/*.lock
+data/*.tmp
+data/chain
+!data/.gitkeep
+
+# Wallet/private-key files
+wallets.json
+*.key
+*.pem
+
+# Logs
+*.log
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~

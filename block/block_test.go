@@ -1,17 +1,57 @@
 package block
 
 import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+var testMiningLimits = MiningLimits{
+	MaxAttempts: 2_000_000,
+	MaxNonce:    2_000_000,
+}
+
+func createSignedTransaction(
+	t *testing.T,
+	recipient string,
+	amount int64,
+	nonce uint64,
+) Transaction {
+	t.Helper()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+
+	tx := Transaction{
+		Recipient: recipient,
+		Amount:    amount,
+		Nonce:     nonce,
+	}
+
+	if err := tx.Sign(privateKey); err != nil {
+		t.Fatalf("failed to sign transaction: %v", err)
+	}
+
+	return tx
+}
 
 func sampleBlock() *Block {
 	return &Block{
 		Height:    1,
 		Timestamp: 1700000000,
 		Transactions: []Transaction{
-			{Sender: "alice", Recipient: "bob", Amount: 10},
-			{Sender: "bob", Recipient: "carol", Amount: 5},
+			{
+				Sender:    FaucetAccount,
+				Recipient: "alice",
+				Amount:    10,
+				Nonce:     0,
+			},
 		},
 		PrevHash:   "deadbeef",
 		Nonce:      42,
@@ -19,134 +59,451 @@ func sampleBlock() *Block {
 	}
 }
 
-// TestHashDeterministic covers the "Block hashing is deterministic" (FR-3)
-// acceptance scenario: given a block with fixed fields and a fixed nonce,
-// computing its hash twice must yield identical results.
 func TestHashDeterministic(t *testing.T) {
-	b1 := sampleBlock()
-	b2 := sampleBlock()
+	firstBlock := sampleBlock()
+	secondBlock := sampleBlock()
 
-	h1 := b1.ComputeHash()
-	h2 := b2.ComputeHash()
+	firstHash := firstBlock.ComputeHash()
+	secondHash := secondBlock.ComputeHash()
 
-	if h1 != h2 {
-		t.Fatalf("expected identical hashes for identical blocks, got %s vs %s", h1, h2)
+	if firstHash != secondHash {
+		t.Fatalf(
+			"expected identical hashes, got %s and %s",
+			firstHash,
+			secondHash,
+		)
 	}
 
-	// Hashing the same block object twice must also be stable.
-	h1Again := b1.ComputeHash()
-	if h1 != h1Again {
-		t.Fatalf("hashing the same block twice produced different results: %s vs %s", h1, h1Again)
+	recomputedHash := firstBlock.ComputeHash()
+
+	if firstHash != recomputedHash {
+		t.Fatalf(
+			"same block produced different hashes: %s and %s",
+			firstHash,
+			recomputedHash,
+		)
 	}
 }
 
-// TestHashChangesWithContent ensures the hash actually depends on the
-// fields we claim it depends on (a sanity check that ComputeHash isn't
-// accidentally constant or ignoring fields).
 func TestHashChangesWithContent(t *testing.T) {
-	b := sampleBlock()
-	original := b.ComputeHash()
+	originalBlock := sampleBlock()
+	originalHash := originalBlock.ComputeHash()
 
-	mutated := sampleBlock()
-	mutated.Transactions[0].Amount = 999
-	if mutated.ComputeHash() == original {
-		t.Fatalf("expected hash to change when a transaction amount changes")
+	changedTransaction := sampleBlock()
+	changedTransaction.Transactions[0].Amount = 999
+
+	if changedTransaction.ComputeHash() == originalHash {
+		t.Fatal("hash should change when transaction amount changes")
 	}
 
-	mutated2 := sampleBlock()
-	mutated2.Nonce = 43
-	if mutated2.ComputeHash() == original {
-		t.Fatalf("expected hash to change when nonce changes")
+	changedNonce := sampleBlock()
+	changedNonce.Nonce = 43
+
+	if changedNonce.ComputeHash() == originalHash {
+		t.Fatal("hash should change when nonce changes")
 	}
 
-	mutated3 := sampleBlock()
-	mutated3.PrevHash = "different"
-	if mutated3.ComputeHash() == original {
-		t.Fatalf("expected hash to change when PrevHash changes")
+	changedPreviousHash := sampleBlock()
+	changedPreviousHash.PrevHash = "different"
+
+	if changedPreviousHash.ComputeHash() == originalHash {
+		t.Fatal("hash should change when previous hash changes")
+	}
+
+	changedDifficulty := sampleBlock()
+	changedDifficulty.Difficulty = 3
+
+	if changedDifficulty.ComputeHash() == originalHash {
+		t.Fatal("hash should change when difficulty changes")
 	}
 }
 
-// TestMineMeetsDifficulty covers the "A mined block satisfies the
-// difficulty target" (FR-5) acceptance scenario: mining must produce a
-// hash with at least N leading zero hex digits, and the returned nonce
-// must reproduce that exact hash.
 func TestMineMeetsDifficulty(t *testing.T) {
 	const difficulty = 3
-	b := NewBlock(1, []Transaction{{Sender: "alice", Recipient: "bob", Amount: 1}}, "someprevhash", difficulty)
 
-	result := b.Mine(difficulty)
+	testBlock := NewBlock(
+		1,
+		[]Transaction{
+			{
+				Sender:    FaucetAccount,
+				Recipient: "alice",
+				Amount:    1,
+				Nonce:     0,
+			},
+		},
+		"someprevhash",
+		difficulty,
+	)
 
-	if !strings.HasPrefix(result.Hash, strings.Repeat("0", difficulty)) {
-		t.Fatalf("mined hash %s does not have %d leading zeros", result.Hash, difficulty)
-	}
-	if b.Hash != result.Hash {
-		t.Fatalf("block.Hash (%s) does not match MineResult.Hash (%s)", b.Hash, result.Hash)
-	}
-	if b.Nonce != result.Nonce {
-		t.Fatalf("block.Nonce (%d) does not match MineResult.Nonce (%d)", b.Nonce, result.Nonce)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	result, err := testBlock.Mine(ctx, testMiningLimits)
+	if err != nil {
+		t.Fatalf("mining failed: %v", err)
 	}
 
-	// The nonce found must reproduce the exact same hash on recomputation.
-	recomputed := b.ComputeHash()
-	if recomputed != result.Hash {
-		t.Fatalf("recomputing with the found nonce gave a different hash: %s vs %s", recomputed, result.Hash)
+	expectedPrefix := strings.Repeat("0", difficulty)
+
+	if !strings.HasPrefix(result.Hash, expectedPrefix) {
+		t.Fatalf(
+			"hash %s does not start with %s",
+			result.Hash,
+			expectedPrefix,
+		)
+	}
+
+	if testBlock.Hash != result.Hash {
+		t.Fatalf(
+			"block hash %s does not match result hash %s",
+			testBlock.Hash,
+			result.Hash,
+		)
+	}
+
+	if testBlock.Nonce != result.Nonce {
+		t.Fatalf(
+			"block nonce %d does not match result nonce %d",
+			testBlock.Nonce,
+			result.Nonce,
+		)
+	}
+
+	if recomputed := testBlock.ComputeHash(); recomputed != result.Hash {
+		t.Fatalf(
+			"recomputed hash %s does not match mined hash %s",
+			recomputed,
+			result.Hash,
+		)
+	}
+
+	if result.Difficulty != difficulty {
+		t.Fatalf(
+			"expected difficulty %d, got %d",
+			difficulty,
+			result.Difficulty,
+		)
 	}
 }
 
-// TestMeetsDifficultyEdgeCases exercises the leading-zero check directly.
+func TestMineDoesNotReplaceBlockDifficulty(t *testing.T) {
+	const assignedDifficulty = 2
+
+	testBlock := NewBlock(
+		1,
+		[]Transaction{
+			{
+				Sender:    FaucetAccount,
+				Recipient: "alice",
+				Amount:    10,
+			},
+		},
+		"previous",
+		assignedDifficulty,
+	)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	result, err := testBlock.Mine(ctx, testMiningLimits)
+	if err != nil {
+		t.Fatalf("mining failed: %v", err)
+	}
+
+	if testBlock.Difficulty != assignedDifficulty {
+		t.Fatalf(
+			"block difficulty changed: got %d, want %d",
+			testBlock.Difficulty,
+			assignedDifficulty,
+		)
+	}
+
+	if result.Difficulty != assignedDifficulty {
+		t.Fatalf(
+			"result difficulty is %d, want %d",
+			result.Difficulty,
+			assignedDifficulty,
+		)
+	}
+}
+
+func TestMineStopsAtMaximumAttempts(t *testing.T) {
+	testBlock := NewBlock(
+		1,
+		[]Transaction{
+			{
+				Sender:    FaucetAccount,
+				Recipient: "alice",
+				Amount:    1,
+			},
+		},
+		"previous",
+		64,
+	)
+
+	limits := MiningLimits{
+		MaxAttempts: 1,
+		MaxNonce:    100,
+	}
+
+	_, err := testBlock.Mine(context.Background(), limits)
+
+	if !errors.Is(err, ErrMaxAttempts) {
+		t.Fatalf(
+			"expected ErrMaxAttempts, got %v",
+			err,
+		)
+	}
+}
+
+func TestMineCanBeCancelled(t *testing.T) {
+	testBlock := NewBlock(
+		1,
+		[]Transaction{
+			{
+				Sender:    FaucetAccount,
+				Recipient: "alice",
+				Amount:    1,
+			},
+		},
+		"previous",
+		64,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := testBlock.Mine(
+		ctx,
+		MiningLimits{
+			MaxAttempts: 1_000_000,
+			MaxNonce:    1_000_000,
+		},
+	)
+
+	if !errors.Is(err, ErrMiningCancelled) {
+		t.Fatalf(
+			"expected ErrMiningCancelled, got %v",
+			err,
+		)
+	}
+}
+
 func TestMeetsDifficultyEdgeCases(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		hash       string
 		difficulty int
-		want       bool
+		expected   bool
 	}{
-		{"0000abcd", 4, true},
-		{"0000abcd", 5, false},
-		{"000abcd", 4, false},
-		{"anything", 0, true},
-		{"", 1, false},
+		{
+			hash:       "0000abcd",
+			difficulty: 4,
+			expected:   true,
+		},
+		{
+			hash:       "0000abcd",
+			difficulty: 5,
+			expected:   false,
+		},
+		{
+			hash:       "000abcd",
+			difficulty: 4,
+			expected:   false,
+		},
+		{
+			hash:       "anything",
+			difficulty: 0,
+			expected:   true,
+		},
+		{
+			hash:       "",
+			difficulty: 1,
+			expected:   false,
+		},
+		{
+			hash:       "0000",
+			difficulty: -1,
+			expected:   false,
+		},
+		{
+			hash:       strings.Repeat("0", 64),
+			difficulty: 65,
+			expected:   false,
+		},
 	}
-	for _, tc := range cases {
-		got := MeetsDifficulty(tc.hash, tc.difficulty)
-		if got != tc.want {
-			t.Errorf("MeetsDifficulty(%q, %d) = %v, want %v", tc.hash, tc.difficulty, got, tc.want)
+
+	for _, test := range tests {
+		actual := MeetsDifficulty(
+			test.hash,
+			test.difficulty,
+		)
+
+		if actual != test.expected {
+			t.Errorf(
+				"MeetsDifficulty(%q, %d) = %v, want %v",
+				test.hash,
+				test.difficulty,
+				actual,
+				test.expected,
+			)
 		}
 	}
 }
 
-// TestTransactionValidate covers FR-4's structural checks.
-func TestTransactionValidate(t *testing.T) {
-	valid := Transaction{Sender: "alice", Recipient: "bob", Amount: 10}
-	if err := valid.Validate(); err != nil {
-		t.Errorf("expected valid transaction to pass, got error: %v", err)
+func TestSignedTransactionValidate(t *testing.T) {
+	tx := createSignedTransaction(
+		t,
+		"recipient-address",
+		10,
+		1,
+	)
+
+	if err := tx.Validate(); err != nil {
+		t.Fatalf(
+			"expected signed transaction to be valid: %v",
+			err,
+		)
+	}
+}
+
+func TestUnsignedNormalTransactionRejected(t *testing.T) {
+	tx := Transaction{
+		Sender:    "alice",
+		Recipient: "bob",
+		Amount:    10,
+		Nonce:     1,
 	}
 
-	cases := []Transaction{
-		{Sender: "alice", Recipient: "bob", Amount: 0},
-		{Sender: "alice", Recipient: "bob", Amount: -5},
-		{Sender: "", Recipient: "bob", Amount: 10},
-		{Sender: "alice", Recipient: "", Amount: 10},
-		{Sender: "alice", Recipient: "alice", Amount: 10},
+	if err := tx.Validate(); err == nil {
+		t.Fatal("expected unsigned normal transaction to be rejected")
 	}
-	for _, tx := range cases {
+}
+
+func TestModifiedSignedTransactionRejected(t *testing.T) {
+	tx := createSignedTransaction(
+		t,
+		"recipient-address",
+		10,
+		1,
+	)
+
+	tx.Amount = 999
+
+	if err := tx.Validate(); err == nil {
+		t.Fatal("expected modified signed transaction to be rejected")
+	}
+}
+
+func TestFaucetTransactionValidate(t *testing.T) {
+	tx := Transaction{
+		Sender:    FaucetAccount,
+		Recipient: "alice",
+		Amount:    100,
+		Nonce:     0,
+	}
+
+	if err := tx.Validate(); err != nil {
+		t.Fatalf(
+			"expected faucet transaction to be valid: %v",
+			err,
+		)
+	}
+}
+
+func TestMalformedTransactionsRejected(t *testing.T) {
+	tests := []Transaction{
+		{
+			Sender:    FaucetAccount,
+			Recipient: "bob",
+			Amount:    0,
+		},
+		{
+			Sender:    FaucetAccount,
+			Recipient: "bob",
+			Amount:    -5,
+		},
+		{
+			Sender:    "",
+			Recipient: "bob",
+			Amount:    10,
+		},
+		{
+			Sender:    FaucetAccount,
+			Recipient: "",
+			Amount:    10,
+		},
+		{
+			Sender:    FaucetAccount,
+			Recipient: FaucetAccount,
+			Amount:    10,
+		},
+	}
+
+	for _, tx := range tests {
 		if err := tx.Validate(); err == nil {
-			t.Errorf("expected transaction %+v to be rejected, but it passed", tx)
+			t.Errorf(
+				"expected transaction %+v to be rejected",
+				tx,
+			)
 		}
 	}
 }
 
-// TestGenesisBlock covers the "Chain starts from a deterministic genesis
-// block" (FR-2) acceptance scenario at the block level: previous-hash
-// equals the fixed genesis value.
 func TestGenesisBlock(t *testing.T) {
-	g := NewGenesisBlock(1)
-	if g.Height != 0 {
-		t.Errorf("expected genesis height 0, got %d", g.Height)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	genesis, err := NewGenesisBlock(
+		ctx,
+		1,
+		testMiningLimits,
+	)
+	if err != nil {
+		t.Fatalf("failed to create genesis block: %v", err)
 	}
-	if g.PrevHash != GenesisPrevHash {
-		t.Errorf("expected genesis PrevHash %s, got %s", GenesisPrevHash, g.PrevHash)
+
+	if genesis.Height != 0 {
+		t.Errorf(
+			"expected genesis height 0, got %d",
+			genesis.Height,
+		)
 	}
+
+	if genesis.Timestamp != 0 {
+		t.Errorf(
+			"expected deterministic genesis timestamp 0, got %d",
+			genesis.Timestamp,
+		)
+	}
+
+	if genesis.PrevHash != GenesisPrevHash {
+		t.Errorf(
+			"expected genesis previous hash %s, got %s",
+			GenesisPrevHash,
+			genesis.PrevHash,
+		)
+	}
+
 	if len(GenesisPrevHash) != 64 {
-		t.Errorf("expected GenesisPrevHash to be 64 hex chars (SHA-256 length), got %d", len(GenesisPrevHash))
+		t.Errorf(
+			"expected 64-character previous hash, got %d",
+			len(GenesisPrevHash),
+		)
+	}
+
+	if !MeetsDifficulty(
+		genesis.Hash,
+		genesis.Difficulty,
+	) {
+		t.Fatal("genesis hash does not meet its difficulty")
 	}
 }

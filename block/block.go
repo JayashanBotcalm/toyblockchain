@@ -1,78 +1,194 @@
-// Package block defines the core Block and Transaction types used by the
-// toy blockchain, along with deterministic hashing and mining logic.
+// Package block defines transactions, blocks, deterministic hashing,
+// digital signatures, and bounded proof-of-work mining.
 package block
 
 import (
+	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
-// GenesisPrevHash is the fixed, well-known previous-hash value used by the
-// genesis block. It is 64 hex characters (32 bytes) of zero, matching the
-// length of a SHA-256 digest so that genesis "looks like" every other block.
 const GenesisPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
-// FaucetAccount is a special sender name that is allowed to create funds
-// out of thin air. It is exempt from balance checks in the ledger. This
-// stands in for a coinbase / minting mechanism (see FR-4).
 const FaucetAccount = "FAUCET"
 
-// Transaction is the smallest unit of value transfer recorded on the chain.
+var (
+	ErrMiningTimeout   = errors.New("mining timeout reached")
+	ErrMaxAttempts     = errors.New("maximum mining attempts reached")
+	ErrMaxNonce        = errors.New("maximum nonce reached")
+	ErrMiningCancelled = errors.New("mining cancelled")
+)
+
+// Transaction represents a transfer between two accounts.
+//
+// Normal transactions require an Ed25519 public key and signature.
+// Faucet transactions are the only unsigned transactions.
 type Transaction struct {
 	Sender    string `json:"sender"`
 	Recipient string `json:"recipient"`
-	Amount    int64  `json:"amount"` // amount is expressed in whole "coins" (int64 to avoid float rounding issues)
+	Amount    int64  `json:"amount"`
+	Nonce     uint64 `json:"nonce"`
+	PublicKey string `json:"public_key,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
-// Validate performs the structural checks required by FR-4: the amount must
-// be strictly positive, and sender/recipient must be non-empty. It does NOT
-// check the sender's balance -- that is the ledger's job, because it
-// requires knowledge of chain history.
-func (t Transaction) Validate() error {
-	if t.Amount <= 0 {
-		return fmt.Errorf("transaction amount must be positive, got %d", t.Amount)
+// transactionPayload contains exactly the transaction fields protected
+// by the digital signature.
+type transactionPayload struct {
+	Sender    string `json:"sender"`
+	Recipient string `json:"recipient"`
+	Amount    int64  `json:"amount"`
+	Nonce     uint64 `json:"nonce"`
+}
+
+func (t Transaction) signingBytes() ([]byte, error) {
+	payload := transactionPayload{
+		Sender:    t.Sender,
+		Recipient: t.Recipient,
+		Amount:    t.Amount,
+		Nonce:     t.Nonce,
 	}
-	if strings.TrimSpace(t.Sender) == "" {
-		return fmt.Errorf("transaction sender must not be empty")
+
+	return json.Marshal(payload)
+}
+
+// AddressFromPublicKey creates an account address from an Ed25519 public key.
+func AddressFromPublicKey(publicKey ed25519.PublicKey) string {
+	sum := sha256.Sum256(publicKey)
+
+	// Twenty bytes are enough for a compact address in this toy project.
+	return hex.EncodeToString(sum[:20])
+}
+
+// Sign signs a normal transaction using an Ed25519 private key.
+func (t *Transaction) Sign(privateKey ed25519.PrivateKey) error {
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return fmt.Errorf(
+			"invalid Ed25519 private key length: got %d, want %d",
+			len(privateKey),
+			ed25519.PrivateKeySize,
+		)
 	}
-	if strings.TrimSpace(t.Recipient) == "" {
-		return fmt.Errorf("transaction recipient must not be empty")
+
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+
+	t.Sender = AddressFromPublicKey(publicKey)
+	t.PublicKey = hex.EncodeToString(publicKey)
+
+	data, err := t.signingBytes()
+	if err != nil {
+		return fmt.Errorf("serialising transaction for signing: %w", err)
 	}
-	if t.Sender == t.Recipient {
-		return fmt.Errorf("sender and recipient must differ")
-	}
+
+	signature := ed25519.Sign(privateKey, data)
+	t.Signature = hex.EncodeToString(signature)
+
 	return nil
 }
 
-// Block is a single link in the chain. It carries a batch of transactions
-// and is cryptographically bound to the block before it via PrevHash.
+// VerifySignature verifies that:
+//
+//  1. the public key creates the claimed sender address,
+//  2. the signature was created by the matching private key,
+//  3. the signed transaction fields were not modified.
+func (t Transaction) VerifySignature() error {
+	if t.Sender == FaucetAccount {
+		if t.PublicKey != "" || t.Signature != "" {
+			return fmt.Errorf("faucet transaction must not contain a signature")
+		}
+
+		return nil
+	}
+
+	publicKeyBytes, err := hex.DecodeString(t.PublicKey)
+	if err != nil || len(publicKeyBytes) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid transaction public key")
+	}
+
+	signatureBytes, err := hex.DecodeString(t.Signature)
+	if err != nil || len(signatureBytes) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid transaction signature encoding")
+	}
+
+	publicKey := ed25519.PublicKey(publicKeyBytes)
+
+	expectedAddress := AddressFromPublicKey(publicKey)
+	if expectedAddress != t.Sender {
+		return fmt.Errorf("public key does not own sender address")
+	}
+
+	data, err := t.signingBytes()
+	if err != nil {
+		return fmt.Errorf("serialising transaction for verification: %w", err)
+	}
+
+	if !ed25519.Verify(publicKey, data, signatureBytes) {
+		return fmt.Errorf("transaction signature verification failed")
+	}
+
+	return nil
+}
+
+// Validate performs structural validation and signature verification.
+//
+// Balance and replay validation belong to the ledger package because they
+// depend on previous blockchain state.
+func (t Transaction) Validate() error {
+	if t.Amount <= 0 {
+		return fmt.Errorf(
+			"transaction amount must be positive, got %d",
+			t.Amount,
+		)
+	}
+
+	if strings.TrimSpace(t.Sender) == "" {
+		return fmt.Errorf("transaction sender must not be empty")
+	}
+
+	if strings.TrimSpace(t.Recipient) == "" {
+		return fmt.Errorf("transaction recipient must not be empty")
+	}
+
+	if t.Sender == t.Recipient {
+		return fmt.Errorf("sender and recipient must differ")
+	}
+
+	if t.Sender == FaucetAccount {
+		if t.Nonce != 0 {
+			return fmt.Errorf("faucet transaction nonce must be 0")
+		}
+
+		return t.VerifySignature()
+	}
+
+	if t.Nonce == 0 {
+		return fmt.Errorf("signed transaction nonce must be greater than 0")
+	}
+
+	return t.VerifySignature()
+}
+
+// Block is one link in the blockchain.
 type Block struct {
 	Height       int           `json:"height"`
-	Timestamp    int64         `json:"timestamp"` // Unix seconds
+	Timestamp    int64         `json:"timestamp"`
 	Transactions []Transaction `json:"transactions"`
 	PrevHash     string        `json:"prev_hash"`
 	Nonce        uint64        `json:"nonce"`
-	Difficulty   int           `json:"difficulty"` // number of required leading hex zeros at mining time
+	Difficulty   int           `json:"difficulty"`
 	Hash         string        `json:"hash"`
 }
 
-// hashPayload is the canonical, ordered representation of a block that is
-// fed into SHA-256. It deliberately excludes the Hash field itself (a block
-// cannot include its own hash as an input to that hash) and fixes field
-// order explicitly via struct tags + Go's stable struct-to-JSON field order,
-// rather than relying on map iteration (which Go randomises).
+// hashPayload is the deterministic block representation passed to SHA-256.
 //
-// Fields, in the exact order they are hashed:
-//  1. height
-//  2. timestamp
-//  3. transactions (each: sender, recipient, amount, in that order)
-//  4. prev_hash
-//  5. nonce
-//  6. difficulty
+// Hash is deliberately excluded because a block cannot use its own unknown
+// hash while calculating that hash.
 type hashPayload struct {
 	Height       int           `json:"height"`
 	Timestamp    int64         `json:"timestamp"`
@@ -82,10 +198,7 @@ type hashPayload struct {
 	Difficulty   int           `json:"difficulty"`
 }
 
-// ComputeHash deterministically hashes the block's fields (excluding Hash).
-// Because encoding/json always serialises struct fields in declaration
-// order (never map order) and Transaction has no maps, marshalling
-// hashPayload is fully deterministic across runs and machines.
+// ComputeHash returns the deterministic SHA-256 block hash.
 func (b *Block) ComputeHash() string {
 	payload := hashPayload{
 		Height:       b.Height,
@@ -95,119 +208,187 @@ func (b *Block) ComputeHash() string {
 		Nonce:        b.Nonce,
 		Difficulty:   b.Difficulty,
 	}
-	// json.Marshal on a struct with no maps is deterministic: field order
-	// follows struct declaration order every time.
+
 	data, err := json.Marshal(payload)
 	if err != nil {
-		// Transaction/Block contain only marshalable primitive types, so
-		// this should never happen; a panic here indicates a programming
-		// error (e.g. someone added a channel or func field).
-		panic(fmt.Sprintf("block: failed to marshal hash payload: %v", err))
+		panic(fmt.Sprintf(
+			"block: failed to marshal hash payload: %v",
+			err,
+		))
 	}
+
 	sum := sha256.Sum256(data)
+
 	return hex.EncodeToString(sum[:])
 }
 
-// meetsDifficulty reports whether hash has at least `difficulty` leading
-// hex zero characters.
-func meetsDifficulty(hash string, difficulty int) bool {
-	if difficulty <= 0 {
-		return true
-	}
-	if difficulty > len(hash) {
+// MeetsDifficulty verifies the required number of leading hexadecimal zeros.
+func MeetsDifficulty(hash string, difficulty int) bool {
+	if difficulty < 0 || difficulty > sha256.Size*2 {
 		return false
 	}
-	return hash[:difficulty] == strings.Repeat("0", difficulty)
+
+	expectedPrefix := strings.Repeat("0", difficulty)
+
+	return strings.HasPrefix(hash, expectedPrefix)
 }
 
-// MeetsDifficulty exposes meetsDifficulty for use by other packages (chain
-// validation needs it too).
-func MeetsDifficulty(hash string, difficulty int) bool {
-	return meetsDifficulty(hash, difficulty)
-}
-
-// MineResult carries the outcome of a mining run, used both by the CLI (to
-// report progress) and by the research report's difficulty experiments.
+// MineResult describes a completed mining operation.
 type MineResult struct {
-	Nonce      uint64
-	Hash       string
-	Attempts   uint64
-	Elapsed    time.Duration
-	Difficulty int
+	Nonce      uint64        `json:"nonce"`
+	Hash       string        `json:"hash"`
+	Attempts   uint64        `json:"attempts"`
+	Elapsed    time.Duration `json:"elapsed"`
+	Difficulty int           `json:"difficulty"`
 }
 
-// NewBlock constructs a block with the given height, transactions and
-// previous hash, ready to be mined. Timestamp is set to "now".
-func NewBlock(height int, txs []Transaction, prevHash string, difficulty int) *Block {
+// MiningLimits prevents mining from running forever.
+type MiningLimits struct {
+	MaxAttempts uint64
+	MaxNonce    uint64
+}
+
+// NewBlock creates a block with its difficulty permanently assigned.
+//
+// Mine does not accept another difficulty, so it cannot silently replace
+// the difficulty stored in the block.
+func NewBlock(
+	height int,
+	transactions []Transaction,
+	previousHash string,
+	difficulty int,
+) *Block {
+	transactionCopy := append([]Transaction(nil), transactions...)
+
 	return &Block{
 		Height:       height,
 		Timestamp:    time.Now().Unix(),
-		Transactions: txs,
-		PrevHash:     prevHash,
+		Transactions: transactionCopy,
+		PrevHash:     previousHash,
 		Nonce:        0,
 		Difficulty:   difficulty,
+		Hash:         "",
 	}
 }
 
-// Mine performs proof-of-work: it searches nonce values starting at 0 until
-// ComputeHash() produces a hash with at least `difficulty` leading hex
-// zeros (FR-5). On success it sets b.Nonce and b.Hash and returns a
-// MineResult describing the search.
-func (b *Block) Mine(difficulty int) MineResult {
-	b.Difficulty = difficulty
+// Mine performs bounded Proof of Work.
+//
+// It uses only b.Difficulty. Therefore, the difficulty assigned by NewBlock
+// cannot be silently changed by passing another argument.
+//
+// Cancellation and timeout are controlled through context.Context.
+func (b *Block) Mine(
+	ctx context.Context,
+	limits MiningLimits,
+) (MineResult, error) {
+	if b.Difficulty < 0 || b.Difficulty > sha256.Size*2 {
+		return MineResult{}, fmt.Errorf(
+			"invalid block difficulty %d",
+			b.Difficulty,
+		)
+	}
+
 	start := time.Now()
 	var attempts uint64
+
 	for nonce := uint64(0); ; nonce++ {
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return MineResult{}, ErrMiningTimeout
+			}
+
+			return MineResult{}, ErrMiningCancelled
+
+		default:
+		}
+
+		if limits.MaxAttempts > 0 && attempts >= limits.MaxAttempts {
+			return MineResult{}, ErrMaxAttempts
+		}
+
+		if limits.MaxNonce > 0 && nonce > limits.MaxNonce {
+			return MineResult{}, ErrMaxNonce
+		}
+
 		b.Nonce = nonce
 		attempts++
-		h := b.ComputeHash()
-		if meetsDifficulty(h, difficulty) {
-			b.Hash = h
+
+		hash := b.ComputeHash()
+
+		if MeetsDifficulty(hash, b.Difficulty) {
+			b.Hash = hash
+
 			return MineResult{
 				Nonce:      nonce,
-				Hash:       h,
+				Hash:       hash,
 				Attempts:   attempts,
 				Elapsed:    time.Since(start),
-				Difficulty: difficulty,
-			}
+				Difficulty: b.Difficulty,
+			}, nil
+		}
+
+		// Prevent uint64 overflow from returning to nonce zero.
+		if nonce == ^uint64(0) {
+			return MineResult{}, ErrMaxNonce
 		}
 	}
 }
 
-// NewGenesisBlock returns the single, deterministic block that starts every
-// chain (FR-2). It is mined at the given difficulty like any other block so
-// that chain validation logic can treat it uniformly, but height 0 and the
-// fixed PrevHash make it recognisable as genesis.
-func NewGenesisBlock(difficulty int) *Block {
-	b := &Block{
+// NewGenesisBlock creates and mines the deterministic genesis block.
+func NewGenesisBlock(
+	ctx context.Context,
+	difficulty int,
+	limits MiningLimits,
+) (*Block, error) {
+	genesis := &Block{
 		Height:       0,
-		Timestamp:    0, // fixed timestamp keeps genesis fully deterministic across runs
+		Timestamp:    0,
 		Transactions: []Transaction{},
 		PrevHash:     GenesisPrevHash,
 		Nonce:        0,
 		Difficulty:   difficulty,
+		Hash:         "",
 	}
-	b.Mine(difficulty)
-	return b
+
+	if _, err := genesis.Mine(ctx, limits); err != nil {
+		return nil, fmt.Errorf("mining genesis block: %w", err)
+	}
+
+	return genesis, nil
 }
 
-// String renders a block in a readable, multi-line form for the CLI's
-// "print" command.
+// String returns a human-readable block representation.
 func (b *Block) String() string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Block #%d\n", b.Height)
-	fmt.Fprintf(&sb, "  Timestamp:  %s\n", time.Unix(b.Timestamp, 0).UTC().Format(time.RFC3339))
-	fmt.Fprintf(&sb, "  PrevHash:   %s\n", b.PrevHash)
-	fmt.Fprintf(&sb, "  Hash:       %s\n", b.Hash)
-	fmt.Fprintf(&sb, "  Nonce:      %d\n", b.Nonce)
-	fmt.Fprintf(&sb, "  Difficulty: %d\n", b.Difficulty)
+	var builder strings.Builder
+
+	fmt.Fprintf(&builder, "Block #%d\n", b.Height)
+	fmt.Fprintf(
+		&builder,
+		"  Timestamp:  %s\n",
+		time.Unix(b.Timestamp, 0).UTC().Format(time.RFC3339),
+	)
+	fmt.Fprintf(&builder, "  PrevHash:   %s\n", b.PrevHash)
+	fmt.Fprintf(&builder, "  Hash:       %s\n", b.Hash)
+	fmt.Fprintf(&builder, "  Nonce:      %d\n", b.Nonce)
+	fmt.Fprintf(&builder, "  Difficulty: %d\n", b.Difficulty)
+
 	if len(b.Transactions) == 0 {
-		fmt.Fprintf(&sb, "  Transactions: (none)\n")
+		fmt.Fprintln(&builder, "  Transactions: (none)")
 	} else {
-		fmt.Fprintf(&sb, "  Transactions:\n")
+		fmt.Fprintln(&builder, "  Transactions:")
+
 		for _, tx := range b.Transactions {
-			fmt.Fprintf(&sb, "    - %s -> %s : %d\n", tx.Sender, tx.Recipient, tx.Amount)
+			fmt.Fprintf(
+				&builder,
+				"    - %s -> %s : %d (tx nonce %d)\n",
+				tx.Sender,
+				tx.Recipient,
+				tx.Amount,
+				tx.Nonce,
+			)
 		}
 	}
-	return sb.String()
+
+	return builder.String()
 }

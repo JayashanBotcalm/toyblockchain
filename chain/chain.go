@@ -1,211 +1,512 @@
-// Package chain ties block, ledger together into an append-only,
-// proof-of-work blockchain with full validation and JSON persistence.
+// Package chain manages the blockchain, pending transactions,
+// difficulty policy, validation and safe JSON persistence.
 package chain
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"time"
 
 	"toyblockchain/block"
 	"toyblockchain/ledger"
 )
 
-// DefaultDifficulty is used when no explicit difficulty is configured.
-// Kept low so mining finishes in well under a second on a laptop.
 const DefaultDifficulty = 4
 
-// DefaultMaxTxPerBlock caps how many pending transactions are swept into a
-// single block when mining (FR-9).
 const DefaultMaxTxPerBlock = 10
 
-// Chain is the in-memory representation of the blockchain plus its pending
-// transaction pool. It is the single source of truth for both block data
-// and (derived) account balances.
-type Chain struct {
-	Blocks        []*block.Block      `json:"blocks"`
-	Pending       []block.Transaction `json:"pending"`
-	Difficulty    int                 `json:"difficulty"`
-	MaxTxPerBlock int                 `json:"max_tx_per_block"`
+// DifficultyRule records the height at which a difficulty becomes active.
+//
+// Example:
+//
+//	{StartHeight: 0, Difficulty: 4}
+//	{StartHeight: 5, Difficulty: 6}
+//
+// Blocks 0-4 use difficulty 4.
+// Block 5 and future blocks use difficulty 6.
+type DifficultyRule struct {
+	StartHeight int `json:"start_height"`
+	Difficulty  int `json:"difficulty"`
 }
 
-// New creates a fresh chain containing only the genesis block (FR-2).
-func New(difficulty, maxTxPerBlock int) *Chain {
+// Chain is the persisted blockchain state.
+type Chain struct {
+	Blocks             []*block.Block      `json:"blocks"`
+	Pending            []block.Transaction `json:"pending"`
+	DifficultySchedule []DifficultyRule    `json:"difficulty_schedule"`
+	MaxTxPerBlock      int                 `json:"max_tx_per_block"`
+}
+
+// New creates a new chain and mines its genesis block.
+func New(
+	ctx context.Context,
+	difficulty int,
+	maxTxPerBlock int,
+	limits block.MiningLimits,
+) (*Chain, error) {
 	if difficulty < 0 {
 		difficulty = DefaultDifficulty
 	}
+
 	if maxTxPerBlock <= 0 {
 		maxTxPerBlock = DefaultMaxTxPerBlock
 	}
-	genesis := block.NewGenesisBlock(difficulty)
-	return &Chain{
-		Blocks:        []*block.Block{genesis},
-		Pending:       []block.Transaction{},
-		Difficulty:    difficulty,
-		MaxTxPerBlock: maxTxPerBlock,
+
+	genesis, err := block.NewGenesisBlock(
+		ctx,
+		difficulty,
+		limits,
+	)
+	if err != nil {
+		return nil, err
 	}
+
+	return &Chain{
+		Blocks:  []*block.Block{genesis},
+		Pending: []block.Transaction{},
+		DifficultySchedule: []DifficultyRule{
+			{
+				StartHeight: 0,
+				Difficulty:  difficulty,
+			},
+		},
+		MaxTxPerBlock: maxTxPerBlock,
+	}, nil
 }
 
-// Ledger rebuilds and returns the current account balances by replaying
-// every block currently on the chain.
-func (c *Chain) Ledger() (*ledger.Ledger, error) {
-	return ledger.Rebuild(c.Blocks)
-}
-
-// Latest returns the most recently added block.
+// Latest returns the blockchain tip.
 func (c *Chain) Latest() *block.Block {
 	return c.Blocks[len(c.Blocks)-1]
 }
 
-// AddTransaction validates a transaction against the current ledger state
-// (including any already-pending transactions, so you cannot double-spend
-// within the same pending pool) and, if valid, queues it for the next
-// mined block (FR-4, FR-7).
-func (c *Chain) AddTransaction(tx block.Transaction) error {
-	l, err := c.Ledger()
-	if err != nil {
-		return fmt.Errorf("rebuilding ledger: %w", err)
+// Ledger derives the current ledger from confirmed blocks.
+func (c *Chain) Ledger() (*ledger.Ledger, error) {
+	return ledger.Rebuild(c.Blocks)
+}
+
+// ExpectedDifficulty returns the policy difficulty for a block height.
+func (c *Chain) ExpectedDifficulty(height int) int {
+	rules := append(
+		[]DifficultyRule(nil),
+		c.DifficultySchedule...,
+	)
+
+	sort.Slice(rules, func(i, j int) bool {
+		return rules[i].StartHeight < rules[j].StartHeight
+	})
+
+	difficulty := DefaultDifficulty
+
+	for _, rule := range rules {
+		if rule.StartHeight > height {
+			break
+		}
+
+		difficulty = rule.Difficulty
 	}
-	// Apply already-pending transactions first so a sender can't queue two
-	// transactions that together overspend their balance.
-	for _, p := range c.Pending {
-		if err := l.Apply(p); err != nil {
-			// Pending pool should already be internally consistent since we
-			// checked each one at AddTransaction time; treat inconsistency
-			// as a serious internal error.
-			return fmt.Errorf("internal error replaying pending pool: %w", err)
+
+	return difficulty
+}
+
+// SetDifficulty schedules a new difficulty from the next block.
+//
+// Existing blocks retain their original required difficulty.
+// The new value applies to the next block and all future blocks until
+// another difficulty rule is added.
+func (c *Chain) SetDifficulty(difficulty int) error {
+	if difficulty < 0 || difficulty > 64 {
+		return fmt.Errorf(
+			"difficulty must be between 0 and 64",
+		)
+	}
+
+	startHeight := c.Latest().Height + 1
+
+	for index := range c.DifficultySchedule {
+		if c.DifficultySchedule[index].StartHeight == startHeight {
+			c.DifficultySchedule[index].Difficulty = difficulty
+			return nil
 		}
 	}
-	if err := l.ValidateTransaction(tx); err != nil {
-		return err
-	}
-	c.Pending = append(c.Pending, tx)
+
+	c.DifficultySchedule = append(
+		c.DifficultySchedule,
+		DifficultyRule{
+			StartHeight: startHeight,
+			Difficulty:  difficulty,
+		},
+	)
+
 	return nil
 }
 
-// MineBlock takes up to MaxTxPerBlock pending transactions, builds a new
-// block on top of the current tip, and performs proof-of-work until the
-// difficulty target is met (FR-5). On success the block is appended to the
-// chain and the mined transactions are removed from the pending pool.
-func (c *Chain) MineBlock() (*block.Block, block.MineResult, error) {
+// AddTransaction validates confirmed and pending transaction state.
+func (c *Chain) AddTransaction(tx block.Transaction) error {
+	currentLedger, err := c.Ledger()
+	if err != nil {
+		return fmt.Errorf("rebuilding ledger: %w", err)
+	}
+
+	// Include pending transactions to prevent pending-pool double spending
+	// and duplicate nonces.
+	for _, pendingTransaction := range c.Pending {
+		if err := currentLedger.Apply(pendingTransaction); err != nil {
+			return fmt.Errorf(
+				"invalid pending pool: %w",
+				err,
+			)
+		}
+	}
+
+	if err := currentLedger.ValidateTransaction(tx); err != nil {
+		return err
+	}
+
+	c.Pending = append(c.Pending, tx)
+
+	return nil
+}
+
+// MineBlock mines a block using the policy difficulty expected at its height.
+//
+// Mining failure does not remove pending transactions and does not append
+// a partially mined block.
+func (c *Chain) MineBlock(
+	ctx context.Context,
+	limits block.MiningLimits,
+) (*block.Block, block.MineResult, error) {
 	if len(c.Pending) == 0 {
-		return nil, block.MineResult{}, fmt.Errorf("no pending transactions to mine")
+		return nil, block.MineResult{}, fmt.Errorf(
+			"no pending transactions to mine",
+		)
 	}
 
-	n := len(c.Pending)
-	if n > c.MaxTxPerBlock {
-		n = c.MaxTxPerBlock
-	}
-	batch := make([]block.Transaction, n)
-	copy(batch, c.Pending[:n])
+	transactionCount := len(c.Pending)
 
-	tip := c.Latest()
-	newBlock := block.NewBlock(tip.Height+1, batch, tip.Hash, c.Difficulty)
-	result := newBlock.Mine(c.Difficulty)
+	if transactionCount > c.MaxTxPerBlock {
+		transactionCount = c.MaxTxPerBlock
+	}
+
+	batch := append(
+		[]block.Transaction(nil),
+		c.Pending[:transactionCount]...,
+	)
+
+	previousBlock := c.Latest()
+	newHeight := previousBlock.Height + 1
+
+	expectedDifficulty := c.ExpectedDifficulty(newHeight)
+
+	newBlock := block.NewBlock(
+		newHeight,
+		batch,
+		previousBlock.Hash,
+		expectedDifficulty,
+	)
+
+	result, err := newBlock.Mine(ctx, limits)
+	if err != nil {
+		return nil, block.MineResult{}, err
+	}
 
 	c.Blocks = append(c.Blocks, newBlock)
-	c.Pending = c.Pending[n:]
+	c.Pending = c.Pending[transactionCount:]
 
 	return newBlock, result, nil
 }
 
-// ValidationError describes precisely why chain validation failed,
-// including which block was the first offender (FR-6).
+// ValidationError identifies the first invalid block.
 type ValidationError struct {
 	BlockHeight int
 	Reason      string
 }
 
 func (e *ValidationError) Error() string {
-	return fmt.Sprintf("block %d invalid: %s", e.BlockHeight, e.Reason)
+	return fmt.Sprintf(
+		"block %d invalid: %s",
+		e.BlockHeight,
+		e.Reason,
+	)
 }
 
-// Validate walks the entire chain and checks, for every block:
-//  1. its stored hash matches a fresh recomputation (detects tampering with
-//     any field, including transactions),
-//  2. its PrevHash correctly links to the previous block's stored hash,
-//  3. its hash satisfies the proof-of-work target for its recorded difficulty,
-//  4. its height is exactly one more than the previous block's height, and
-//  5. its timestamp is not earlier than the previous block's timestamp.
-//
-// It also replays every transaction through the ledger to confirm no block
-// contains a transaction that would have overspent at the time it was
-// mined. Validation stops and returns at the FIRST offending block, as
-// required by FR-6.
+// Validate performs complete blockchain and ledger validation.
 func (c *Chain) Validate() error {
 	if len(c.Blocks) == 0 {
-		return &ValidationError{BlockHeight: -1, Reason: "chain is empty"}
+		return &ValidationError{
+			BlockHeight: -1,
+			Reason:      "chain is empty",
+		}
 	}
 
-	genesis := c.Blocks[0]
-	if genesis.Height != 0 {
-		return &ValidationError{BlockHeight: genesis.Height, Reason: "genesis block must have height 0"}
-	}
-	if genesis.PrevHash != block.GenesisPrevHash {
-		return &ValidationError{BlockHeight: genesis.Height, Reason: "genesis block has wrong PrevHash"}
-	}
-	if recomputed := genesis.ComputeHash(); recomputed != genesis.Hash {
-		return &ValidationError{BlockHeight: genesis.Height, Reason: fmt.Sprintf("stored hash %s does not match recomputed hash %s", genesis.Hash, recomputed)}
-	}
-	if !block.MeetsDifficulty(genesis.Hash, genesis.Difficulty) {
-		return &ValidationError{BlockHeight: genesis.Height, Reason: "genesis hash does not meet its recorded difficulty"}
+	if len(c.DifficultySchedule) == 0 {
+		return &ValidationError{
+			BlockHeight: -1,
+			Reason:      "difficulty schedule is empty",
+		}
 	}
 
-	l := ledger.New()
-	if err := l.ApplyBlock(genesis); err != nil {
-		return &ValidationError{BlockHeight: genesis.Height, Reason: err.Error()}
-	}
+	currentLedger := ledger.New()
 
-	for i := 1; i < len(c.Blocks); i++ {
-		prev := c.Blocks[i-1]
-		cur := c.Blocks[i]
+	for index, currentBlock := range c.Blocks {
+		expectedDifficulty := c.ExpectedDifficulty(
+			currentBlock.Height,
+		)
 
-		if cur.Height != prev.Height+1 {
-			return &ValidationError{BlockHeight: cur.Height, Reason: fmt.Sprintf("height %d is not prev height %d + 1", cur.Height, prev.Height)}
+		// This prevents an attacker from changing a block's recorded
+		// difficulty to a lower value.
+		if currentBlock.Difficulty != expectedDifficulty {
+			return &ValidationError{
+				BlockHeight: currentBlock.Height,
+				Reason: fmt.Sprintf(
+					"recorded difficulty %d does not match expected difficulty %d",
+					currentBlock.Difficulty,
+					expectedDifficulty,
+				),
+			}
 		}
-		if cur.Timestamp < prev.Timestamp {
-			return &ValidationError{BlockHeight: cur.Height, Reason: "timestamp is earlier than previous block"}
+
+		recomputedHash := currentBlock.ComputeHash()
+
+		if recomputedHash != currentBlock.Hash {
+			return &ValidationError{
+				BlockHeight: currentBlock.Height,
+				Reason:      "stored hash does not match recomputed hash",
+			}
 		}
-		if cur.PrevHash != prev.Hash {
-			return &ValidationError{BlockHeight: cur.Height, Reason: fmt.Sprintf("prev_hash %s does not match previous block's hash %s", cur.PrevHash, prev.Hash)}
+
+		if !block.MeetsDifficulty(
+			currentBlock.Hash,
+			expectedDifficulty,
+		) {
+			return &ValidationError{
+				BlockHeight: currentBlock.Height,
+				Reason:      "hash does not meet expected difficulty",
+			}
 		}
-		if recomputed := cur.ComputeHash(); recomputed != cur.Hash {
-			return &ValidationError{BlockHeight: cur.Height, Reason: fmt.Sprintf("stored hash %s does not match recomputed hash %s", cur.Hash, recomputed)}
+
+		if index == 0 {
+			if currentBlock.Height != 0 {
+				return &ValidationError{
+					BlockHeight: currentBlock.Height,
+					Reason:      "genesis height must be 0",
+				}
+			}
+
+			if currentBlock.PrevHash != block.GenesisPrevHash {
+				return &ValidationError{
+					BlockHeight: currentBlock.Height,
+					Reason:      "wrong genesis previous hash",
+				}
+			}
+		} else {
+			previousBlock := c.Blocks[index-1]
+
+			if currentBlock.Height != previousBlock.Height+1 {
+				return &ValidationError{
+					BlockHeight: currentBlock.Height,
+					Reason:      "invalid height sequence",
+				}
+			}
+
+			if currentBlock.Timestamp < previousBlock.Timestamp {
+				return &ValidationError{
+					BlockHeight: currentBlock.Height,
+					Reason:      "timestamp earlier than previous block",
+				}
+			}
+
+			if currentBlock.PrevHash != previousBlock.Hash {
+				return &ValidationError{
+					BlockHeight: currentBlock.Height,
+					Reason:      "previous hash link mismatch",
+				}
+			}
 		}
-		if !block.MeetsDifficulty(cur.Hash, cur.Difficulty) {
-			return &ValidationError{BlockHeight: cur.Height, Reason: "hash does not meet its recorded difficulty target"}
-		}
-		if err := l.ApplyBlock(cur); err != nil {
-			return &ValidationError{BlockHeight: cur.Height, Reason: err.Error()}
+
+		// Replaying transactions validates:
+		// - signatures,
+		// - ownership,
+		// - balances,
+		// - transaction nonces,
+		// - replay protection.
+		if err := currentLedger.ApplyBlock(currentBlock); err != nil {
+			return &ValidationError{
+				BlockHeight: currentBlock.Height,
+				Reason:      err.Error(),
+			}
 		}
 	}
 
 	return nil
 }
 
-// Save writes the chain to disk as JSON (FR-8).
+// Save performs an atomic JSON save:
+//
+//  1. write chain.json.tmp,
+//  2. flush it to disk,
+//  3. rename it over chain.json.
+//
+// This prevents partially written JSON files.
 func (c *Chain) Save(path string) error {
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshalling chain: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("writing chain file %s: %w", path, err)
+
+	directory := filepath.Dir(path)
+
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return fmt.Errorf(
+			"creating chain directory: %w",
+			err,
+		)
 	}
+
+	temporaryPath := path + ".tmp"
+
+	file, err := os.OpenFile(
+		temporaryPath,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0644,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"creating temporary chain file: %w",
+			err,
+		)
+	}
+
+	saveCompleted := false
+
+	defer func() {
+		_ = file.Close()
+
+		if !saveCompleted {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf(
+			"writing temporary chain file: %w",
+			err,
+		)
+	}
+
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf(
+			"syncing temporary chain file: %w",
+			err,
+		)
+	}
+
+	if err := file.Close(); err != nil {
+		return fmt.Errorf(
+			"closing temporary chain file: %w",
+			err,
+		)
+	}
+
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf(
+			"atomically replacing chain file: %w",
+			err,
+		)
+	}
+
+	saveCompleted = true
+
 	return nil
 }
 
-// Load reads a chain previously written by Save. If the file does not
-// exist, it returns (nil, os.ErrNotExist) so callers can distinguish
-// "no saved state yet" from a real I/O error.
+// Load reads and validates a saved blockchain.
 func Load(path string) (*Chain, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var c Chain
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parsing chain file %s: %w", path, err)
+
+	var loadedChain Chain
+
+	if err := json.Unmarshal(data, &loadedChain); err != nil {
+		return nil, fmt.Errorf(
+			"parsing chain file: %w",
+			err,
+		)
 	}
-	return &c, nil
+
+	if err := loadedChain.Validate(); err != nil {
+		return nil, fmt.Errorf(
+			"loaded chain is invalid: %w",
+			err,
+		)
+	}
+
+	return &loadedChain, nil
+}
+
+// FileLock prevents two application processes from editing the same JSON
+// blockchain simultaneously.
+type FileLock struct {
+	path string
+}
+
+// AcquireFileLock waits for exclusive ownership of path+".lock".
+func AcquireFileLock(
+	path string,
+	timeout time.Duration,
+) (*FileLock, error) {
+	lockPath := path + ".lock"
+	deadline := time.Now().Add(timeout)
+
+	for {
+		file, err := os.OpenFile(
+			lockPath,
+			os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+			0600,
+		)
+
+		if err == nil {
+			_, _ = fmt.Fprintf(
+				file,
+				"pid=%d\n",
+				os.Getpid(),
+			)
+
+			_ = file.Close()
+
+			return &FileLock{
+				path: lockPath,
+			}, nil
+		}
+
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf(
+				"creating chain lock: %w",
+				err,
+			)
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf(
+				"chain file is locked by another process",
+			)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// Release releases the process-level JSON file lock.
+func (l *FileLock) Release() error {
+	if l == nil {
+		return nil
+	}
+
+	return os.Remove(l.path)
 }

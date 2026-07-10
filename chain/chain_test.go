@@ -1,206 +1,577 @@
 package chain
 
 import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"toyblockchain/block"
 )
 
-// TestNewChainHasGenesis covers the "Chain starts from a deterministic
-// genesis block" acceptance scenario (FR-2): a freshly initialised
-// blockchain contains exactly one block at height 0, whose previous-hash
-// equals the fixed genesis value.
-func TestNewChainHasGenesis(t *testing.T) {
-	c := New(2, 10)
-	if len(c.Blocks) != 1 {
-		t.Fatalf("expected exactly 1 block after New(), got %d", len(c.Blocks))
+var chainTestLimits = block.MiningLimits{
+	MaxAttempts: 3_000_000,
+	MaxNonce:    3_000_000,
+}
+
+type chainTestWallet struct {
+	address    string
+	privateKey ed25519.PrivateKey
+}
+
+func createChainTestWallet(t *testing.T) chainTestWallet {
+	t.Helper()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate wallet: %v", err)
 	}
-	if c.Blocks[0].Height != 0 {
-		t.Errorf("expected genesis height 0, got %d", c.Blocks[0].Height)
-	}
-	if c.Blocks[0].PrevHash != block.GenesisPrevHash {
-		t.Errorf("expected genesis PrevHash %s, got %s", block.GenesisPrevHash, c.Blocks[0].PrevHash)
+
+	return chainTestWallet{
+		address:    block.AddressFromPublicKey(publicKey),
+		privateKey: privateKey,
 	}
 }
 
-// buildHonestChain constructs a small chain with a few mined blocks and
-// real transactions, used as a fixture by several tests below.
+func signChainTransaction(
+	t *testing.T,
+	sender chainTestWallet,
+	recipient string,
+	amount int64,
+	nonce uint64,
+) block.Transaction {
+	t.Helper()
+
+	tx := block.Transaction{
+		Recipient: recipient,
+		Amount:    amount,
+		Nonce:     nonce,
+	}
+
+	if err := tx.Sign(sender.privateKey); err != nil {
+		t.Fatalf("failed to sign transaction: %v", err)
+	}
+
+	return tx
+}
+
+func createTestChain(
+	t *testing.T,
+	difficulty int,
+) *Chain {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	testChain, err := New(
+		ctx,
+		difficulty,
+		10,
+		chainTestLimits,
+	)
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
+
+	return testChain
+}
+
+func mineTestBlock(
+	t *testing.T,
+	testChain *Chain,
+) *block.Block {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	minedBlock, _, err := testChain.MineBlock(
+		ctx,
+		chainTestLimits,
+	)
+	if err != nil {
+		t.Fatalf("failed to mine block: %v", err)
+	}
+
+	return minedBlock
+}
+
+func TestNewChainHasGenesis(t *testing.T) {
+	testChain := createTestChain(t, 2)
+
+	if len(testChain.Blocks) != 1 {
+		t.Fatalf(
+			"expected one block, got %d",
+			len(testChain.Blocks),
+		)
+	}
+
+	genesis := testChain.Blocks[0]
+
+	if genesis.Height != 0 {
+		t.Errorf(
+			"expected genesis height 0, got %d",
+			genesis.Height,
+		)
+	}
+
+	if genesis.PrevHash != block.GenesisPrevHash {
+		t.Errorf(
+			"unexpected genesis previous hash: %s",
+			genesis.PrevHash,
+		)
+	}
+
+	if genesis.Difficulty != 2 {
+		t.Errorf(
+			"expected genesis difficulty 2, got %d",
+			genesis.Difficulty,
+		)
+	}
+}
+
 func buildHonestChain(t *testing.T) *Chain {
 	t.Helper()
-	c := New(2, 10)
 
-	if err := c.AddTransaction(block.Transaction{Sender: block.FaucetAccount, Recipient: "alice", Amount: 100}); err != nil {
-		t.Fatalf("faucet grant should succeed: %v", err)
-	}
-	if _, _, err := c.MineBlock(); err != nil {
-		t.Fatalf("mining block 1 failed: %v", err)
-	}
+	testChain := createTestChain(t, 2)
 
-	if err := c.AddTransaction(block.Transaction{Sender: "alice", Recipient: "bob", Amount: 30}); err != nil {
-		t.Fatalf("alice->bob transaction should succeed: %v", err)
-	}
-	if _, _, err := c.MineBlock(); err != nil {
-		t.Fatalf("mining block 2 failed: %v", err)
-	}
+	alice := createChainTestWallet(t)
+	bob := createChainTestWallet(t)
+	carol := createChainTestWallet(t)
 
-	if err := c.AddTransaction(block.Transaction{Sender: "bob", Recipient: "carol", Amount: 10}); err != nil {
-		t.Fatalf("bob->carol transaction should succeed: %v", err)
-	}
-	if _, _, err := c.MineBlock(); err != nil {
-		t.Fatalf("mining block 3 failed: %v", err)
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: alice.address,
+			Amount:    100,
+			Nonce:     0,
+		},
+	); err != nil {
+		t.Fatalf("faucet transaction failed: %v", err)
 	}
 
-	return c
+	mineTestBlock(t, testChain)
+
+	if err := testChain.AddTransaction(
+		signChainTransaction(
+			t,
+			alice,
+			bob.address,
+			30,
+			1,
+		),
+	); err != nil {
+		t.Fatalf("Alice-to-Bob transaction failed: %v", err)
+	}
+
+	mineTestBlock(t, testChain)
+
+	if err := testChain.AddTransaction(
+		signChainTransaction(
+			t,
+			bob,
+			carol.address,
+			10,
+			1,
+		),
+	); err != nil {
+		t.Fatalf("Bob-to-Carol transaction failed: %v", err)
+	}
+
+	mineTestBlock(t, testChain)
+
+	return testChain
 }
 
-// TestHonestChainValidates covers the "An honest chain validates
-// successfully" acceptance scenario (FR-6).
 func TestHonestChainValidates(t *testing.T) {
-	c := buildHonestChain(t)
-	if err := c.Validate(); err != nil {
-		t.Fatalf("expected honest chain to validate, got error: %v", err)
+	testChain := buildHonestChain(t)
+
+	if err := testChain.Validate(); err != nil {
+		t.Fatalf(
+			"expected honest chain to validate: %v",
+			err,
+		)
 	}
 }
 
-// TestTamperDetection covers the "Tampering with a block is detected"
-// acceptance scenario (FR-6): modifying a transaction inside an earlier
-// block must cause validation to fail and to identify the first offending
-// block.
 func TestTamperDetection(t *testing.T) {
-	c := buildHonestChain(t)
+	testChain := buildHonestChain(t)
 
-	// Sanity check: chain is valid before tampering.
-	if err := c.Validate(); err != nil {
-		t.Fatalf("chain should be valid before tampering, got: %v", err)
-	}
+	testChain.Blocks[2].Transactions[0].Amount = 999999
 
-	// Tamper with the transaction amount inside block 2 (an "early" block,
-	// not the tip), without recomputing its hash -- exactly what an
-	// attacker editing raw data would do.
-	c.Blocks[2].Transactions[0].Amount = 999999
+	err := testChain.Validate()
 
-	err := c.Validate()
 	if err == nil {
-		t.Fatalf("expected validation to fail after tampering, but it passed")
+		t.Fatal("expected tampered chain validation to fail")
 	}
-	ve, ok := err.(*ValidationError)
+
+	validationError, ok := err.(*ValidationError)
 	if !ok {
-		t.Fatalf("expected a *ValidationError, got %T: %v", err, err)
+		t.Fatalf(
+			"expected ValidationError, got %T",
+			err,
+		)
 	}
-	if ve.BlockHeight != c.Blocks[2].Height {
-		t.Errorf("expected validation to flag block height %d (the tampered block), got %d",
-			c.Blocks[2].Height, ve.BlockHeight)
+
+	if validationError.BlockHeight != 2 {
+		t.Fatalf(
+			"expected block 2 to fail, got block %d",
+			validationError.BlockHeight,
+		)
 	}
 }
 
-// TestTamperDetectionOnPrevHash checks that an attacker who edits a
-// transaction AND recomputes that block's stored hash (to hide the simple
-// hash-mismatch tell) still cannot get away with it: recomputing the hash
-// without redoing the proof-of-work search means the new hash almost
-// certainly no longer meets the block's recorded difficulty target, so
-// validation still fails at the tampered block.
-func TestTamperDetectionOnPrevHash(t *testing.T) {
-	c := buildHonestChain(t)
+func TestTamperedDifficultyRejected(t *testing.T) {
+	testChain := buildHonestChain(t)
 
-	// Simulate a "sophisticated" tamper: attacker edits block 2's data and
-	// even recomputes block 2's own hash to hide the edit, but does not
-	// (cannot, cheaply) redo the proof-of-work.
-	c.Blocks[2].Transactions[0].Amount = 1
-	c.Blocks[2].Hash = c.Blocks[2].ComputeHash()
+	// An attacker tries to lower the difficulty recorded in block 2.
+	testChain.Blocks[2].Difficulty = 0
 
-	err := c.Validate()
+	// Recompute the block hash to hide the basic hash mismatch.
+	testChain.Blocks[2].Hash =
+		testChain.Blocks[2].ComputeHash()
+
+	err := testChain.Validate()
+
 	if err == nil {
-		t.Fatalf("expected validation to fail, but it passed")
+		t.Fatal("expected modified difficulty to be rejected")
 	}
-	ve, ok := err.(*ValidationError)
+
+	validationError, ok := err.(*ValidationError)
 	if !ok {
-		t.Fatalf("expected a *ValidationError, got %T", err)
+		t.Fatalf(
+			"expected ValidationError, got %T",
+			err,
+		)
 	}
-	// Detection happens at block 2 itself: its "fixed up" hash no longer
-	// satisfies the proof-of-work target recorded for that block, because
-	// the attacker did not re-mine it. This demonstrates that patching the
-	// stored hash alone is not enough to hide a tamper.
-	if ve.BlockHeight != c.Blocks[2].Height {
-		t.Errorf("expected the tamper to be detected at block %d, got %d", c.Blocks[2].Height, ve.BlockHeight)
+
+	if validationError.BlockHeight != 2 {
+		t.Fatalf(
+			"expected block 2 to fail, got block %d",
+			validationError.BlockHeight,
+		)
 	}
 }
 
-// TestOverspendingRejected covers the "An overspending transaction is
-// rejected" acceptance scenario (FR-4): given an account whose balance is
-// 100, attempting to send 150 must be rejected and the balance must be
-// unchanged.
+func TestDifficultyScheduleAppliesToFutureBlocks(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: "first-account",
+			Amount:    10,
+		},
+	); err != nil {
+		t.Fatalf("failed to add first transaction: %v", err)
+	}
+
+	firstBlock := mineTestBlock(t, testChain)
+
+	if firstBlock.Difficulty != 1 {
+		t.Fatalf(
+			"expected first block difficulty 1, got %d",
+			firstBlock.Difficulty,
+		)
+	}
+
+	if err := testChain.SetDifficulty(2); err != nil {
+		t.Fatalf("failed to set difficulty: %v", err)
+	}
+
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: "second-account",
+			Amount:    10,
+		},
+	); err != nil {
+		t.Fatalf("failed to add second transaction: %v", err)
+	}
+
+	secondBlock := mineTestBlock(t, testChain)
+
+	if secondBlock.Difficulty != 2 {
+		t.Fatalf(
+			"expected second block difficulty 2, got %d",
+			secondBlock.Difficulty,
+		)
+	}
+
+	// Existing blocks must keep their original difficulty.
+	if firstBlock.Difficulty != 1 {
+		t.Fatalf(
+			"old block difficulty changed to %d",
+			firstBlock.Difficulty,
+		)
+	}
+
+	if testChain.ExpectedDifficulty(firstBlock.Height) != 1 {
+		t.Fatal("old block policy difficulty changed")
+	}
+
+	if testChain.ExpectedDifficulty(secondBlock.Height) != 2 {
+		t.Fatal("new block policy difficulty is incorrect")
+	}
+
+	if err := testChain.Validate(); err != nil {
+		t.Fatalf(
+			"chain with changed future difficulty should validate: %v",
+			err,
+		)
+	}
+}
+
+func TestMiningFailureKeepsPendingTransactions(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: "alice",
+			Amount:    100,
+		},
+	); err != nil {
+		t.Fatalf("failed to add transaction: %v", err)
+	}
+
+	if err := testChain.SetDifficulty(64); err != nil {
+		t.Fatalf("failed to set difficulty: %v", err)
+	}
+
+	ctx := context.Background()
+
+	_, _, err := testChain.MineBlock(
+		ctx,
+		block.MiningLimits{
+			MaxAttempts: 1,
+			MaxNonce:    10,
+		},
+	)
+
+	if !errors.Is(err, block.ErrMaxAttempts) {
+		t.Fatalf(
+			"expected maximum attempts error, got %v",
+			err,
+		)
+	}
+
+	if len(testChain.Pending) != 1 {
+		t.Fatalf(
+			"expected pending transaction to remain, got %d",
+			len(testChain.Pending),
+		)
+	}
+
+	if len(testChain.Blocks) != 1 {
+		t.Fatalf(
+			"failed mining must not append block; got %d blocks",
+			len(testChain.Blocks),
+		)
+	}
+}
+
 func TestOverspendingRejected(t *testing.T) {
-	c := New(1, 10)
-	if err := c.AddTransaction(block.Transaction{Sender: block.FaucetAccount, Recipient: "alice", Amount: 100}); err != nil {
-		t.Fatalf("faucet grant should succeed: %v", err)
-	}
-	if _, _, err := c.MineBlock(); err != nil {
-		t.Fatalf("mining failed: %v", err)
+	testChain := createTestChain(t, 1)
+
+	alice := createChainTestWallet(t)
+	bob := createChainTestWallet(t)
+
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: alice.address,
+			Amount:    100,
+		},
+	); err != nil {
+		t.Fatalf("faucet transaction failed: %v", err)
 	}
 
-	l, err := c.Ledger()
+	mineTestBlock(t, testChain)
+
+	overspend := signChainTransaction(
+		t,
+		alice,
+		bob.address,
+		150,
+		1,
+	)
+
+	if err := testChain.AddTransaction(overspend); err == nil {
+		t.Fatal("expected overspending transaction to be rejected")
+	}
+
+	currentLedger, err := testChain.Ledger()
 	if err != nil {
-		t.Fatalf("ledger rebuild failed: %v", err)
-	}
-	if got := l.Balance("alice"); got != 100 {
-		t.Fatalf("expected alice's balance to be 100, got %d", got)
+		t.Fatalf("failed to rebuild ledger: %v", err)
 	}
 
-	err = c.AddTransaction(block.Transaction{Sender: "alice", Recipient: "bob", Amount: 150})
-	if err == nil {
-		t.Fatalf("expected overspending transaction to be rejected")
-	}
-
-	l2, err := c.Ledger()
-	if err != nil {
-		t.Fatalf("ledger rebuild failed: %v", err)
-	}
-	if got := l2.Balance("alice"); got != 100 {
-		t.Fatalf("expected alice's balance to remain 100 after rejected tx, got %d", got)
+	if actual := currentLedger.Balance(alice.address); actual != 100 {
+		t.Fatalf(
+			"expected Alice balance 100, got %d",
+			actual,
+		)
 	}
 }
 
-// TestMalformedTransactionRejected checks non-positive amounts are refused
-// (part of FR-4).
-func TestMalformedTransactionRejected(t *testing.T) {
-	c := New(1, 10)
-	err := c.AddTransaction(block.Transaction{Sender: "alice", Recipient: "bob", Amount: 0})
+func TestUnsignedTransactionRejected(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    "alice",
+			Recipient: "bob",
+			Amount:    10,
+			Nonce:     1,
+		},
+	)
+
 	if err == nil {
-		t.Fatalf("expected non-positive amount to be rejected")
+		t.Fatal("expected unsigned transaction to be rejected")
 	}
 }
 
-// TestSaveAndLoadRoundTrip covers FR-8 (persistence): a saved chain must
-// reload to an equivalent, still-valid chain.
+func TestPendingDoubleSpendRejected(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	alice := createChainTestWallet(t)
+	bob := createChainTestWallet(t)
+	carol := createChainTestWallet(t)
+
+	if err := testChain.AddTransaction(
+		block.Transaction{
+			Sender:    block.FaucetAccount,
+			Recipient: alice.address,
+			Amount:    100,
+		},
+	); err != nil {
+		t.Fatalf("faucet transaction failed: %v", err)
+	}
+
+	mineTestBlock(t, testChain)
+
+	firstTransaction := signChainTransaction(
+		t,
+		alice,
+		bob.address,
+		80,
+		1,
+	)
+
+	if err := testChain.AddTransaction(firstTransaction); err != nil {
+		t.Fatalf("first pending transaction failed: %v", err)
+	}
+
+	secondTransaction := signChainTransaction(
+		t,
+		alice,
+		carol.address,
+		30,
+		2,
+	)
+
+	if err := testChain.AddTransaction(secondTransaction); err == nil {
+		t.Fatal("expected pending double spend to be rejected")
+	}
+}
+
 func TestSaveAndLoadRoundTrip(t *testing.T) {
-	c := buildHonestChain(t)
+	testChain := buildHonestChain(t)
 
-	dir := t.TempDir()
-	path := dir + "/chain.json"
+	directory := t.TempDir()
+	path := filepath.Join(directory, "chain.json")
 
-	if err := c.Save(path); err != nil {
+	if err := testChain.Save(path); err != nil {
 		t.Fatalf("save failed: %v", err)
 	}
 
-	loaded, err := Load(path)
+	loadedChain, err := Load(path)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
 
-	if len(loaded.Blocks) != len(c.Blocks) {
-		t.Fatalf("expected %d blocks after reload, got %d", len(c.Blocks), len(loaded.Blocks))
+	if len(loadedChain.Blocks) != len(testChain.Blocks) {
+		t.Fatalf(
+			"expected %d blocks, got %d",
+			len(testChain.Blocks),
+			len(loadedChain.Blocks),
+		)
 	}
-	if err := loaded.Validate(); err != nil {
-		t.Fatalf("reloaded chain should still validate, got: %v", err)
+
+	if err := loadedChain.Validate(); err != nil {
+		t.Fatalf(
+			"loaded chain should validate: %v",
+			err,
+		)
 	}
 }
 
-// TestMineBlockNoPending ensures mining with an empty pool is rejected
-// with a clear error rather than producing an empty/junk block.
-func TestMineBlockNoPending(t *testing.T) {
-	c := New(1, 10)
-	_, _, err := c.MineBlock()
+func TestAtomicSaveLeavesNoTemporaryFile(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	directory := t.TempDir()
+	path := filepath.Join(directory, "chain.json")
+
+	if err := testChain.Save(path); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf(
+			"temporary save file still exists: %v",
+			err,
+		)
+	}
+}
+
+func TestFileLockRejectsSecondProcess(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "chain.json")
+
+	firstLock, err := AcquireFileLock(
+		path,
+		100*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+	defer func() {
+		_ = firstLock.Release()
+	}()
+
+	_, err = AcquireFileLock(
+		path,
+		200*time.Millisecond,
+	)
+
 	if err == nil {
-		t.Fatalf("expected error when mining with no pending transactions")
+		t.Fatal("expected second file lock to fail")
+	}
+}
+
+func TestMineBlockNoPending(t *testing.T) {
+	testChain := createTestChain(t, 1)
+
+	_, _, err := testChain.MineBlock(
+		context.Background(),
+		chainTestLimits,
+	)
+
+	if err == nil {
+		t.Fatal("expected error when mining without pending transactions")
 	}
 }
