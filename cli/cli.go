@@ -161,6 +161,13 @@ func (c *CLI) Run(args []string) error {
 	case "retarget-config":
 		return c.cmdRetargetConfig(remainingArgs)
 
+	case "work":
+		c.cmdWork()
+		return nil
+
+	case "resolvefork":
+		return c.cmdResolveFork(remainingArgs)
+
 	case "print":
 		c.cmdPrint()
 		return nil
@@ -205,6 +212,8 @@ func (c *CLI) help() {
   retarget                             Show automatic retarget settings
   retarget-config <on|off> <interval> <target-seconds> <min> <max>
                                         Configure retargeting before block 1
+  work                                 Show accumulated Proof-of-Work
+  resolvefork <candidate-chain.json>   Adopt a stronger compatible chain
   print                                Print the full blockchain
   validate                             Validate the complete blockchain
   balances                             Show all account balances
@@ -537,6 +546,55 @@ func (c *CLI) cmdRetargetConfig(args []string) error {
 
 	c.printf("Retarget configuration updated.\n")
 	c.cmdRetarget()
+
+	return nil
+}
+
+func (c *CLI) cmdWork() {
+	c.printf(
+		"Accumulated work: %s\n",
+		c.Chain.TotalWork().String(),
+	)
+}
+
+func (c *CLI) cmdResolveFork(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf(
+			"usage: resolvefork <candidate-chain.json>",
+		)
+	}
+
+	candidate, err := chain.Load(args[0])
+	if err != nil {
+		return fmt.Errorf(
+			"loading candidate chain: %w",
+			err,
+		)
+	}
+
+	result, err := c.Chain.ResolveFork(candidate)
+	if err != nil {
+		return fmt.Errorf(
+			"fork resolution failed: %w",
+			err,
+		)
+	}
+
+	if err := c.Chain.Save(c.DataFile); err != nil {
+		return fmt.Errorf(
+			"saving resolved chain: %w",
+			err,
+		)
+	}
+
+	c.printf("Fork resolved. Stronger chain adopted.\n")
+	c.printf("  Common ancestor: block %d\n", result.CommonAncestorHeight)
+	c.printf("  Old height:      %d\n", result.OldHeight)
+	c.printf("  New height:      %d\n", result.NewHeight)
+	c.printf("  Old work:        %s\n", result.OldWork)
+	c.printf("  New work:        %s\n", result.NewWork)
+	c.printf("  Pending kept:    %d\n", result.PendingKept)
+	c.printf("  Pending dropped: %d\n", result.PendingDropped)
 
 	return nil
 }

@@ -514,3 +514,36 @@ func TestGenesisBlock(t *testing.T) {
 		t.Fatal("genesis hash does not meet its difficulty")
 	}
 }
+
+func TestGenesisDeterministicAcrossWorkerCounts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	first, err := NewGenesisBlock(
+		ctx,
+		2,
+		MiningLimits{MaxAttempts: 2_000_000, MaxNonce: 2_000_000, Workers: 1},
+	)
+	if err != nil {
+		t.Fatalf("creating first genesis: %v", err)
+	}
+
+	second, err := NewGenesisBlock(
+		ctx,
+		2,
+		MiningLimits{MaxAttempts: 2_000_000, MaxNonce: 2_000_000, Workers: 8},
+	)
+	if err != nil {
+		t.Fatalf("creating second genesis: %v", err)
+	}
+
+	if first.Hash != second.Hash || first.Nonce != second.Nonce {
+		t.Fatalf(
+			"genesis must be deterministic: first nonce/hash=%d/%s second=%d/%s",
+			first.Nonce,
+			first.Hash,
+			second.Nonce,
+			second.Hash,
+		)
+	}
+}

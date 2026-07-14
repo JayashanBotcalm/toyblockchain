@@ -487,7 +487,13 @@ func NewGenesisBlock(
 		Hash:         "",
 	}
 
-	if _, err := genesis.Mine(ctx, limits); err != nil {
+	// Genesis must be deterministic across machines and runs. Normal blocks
+	// may use concurrent mining, but genesis always uses one worker so the
+	// first valid nonce is selected consistently.
+	genesisLimits := limits
+	genesisLimits.Workers = 1
+
+	if _, err := genesis.Mine(ctx, genesisLimits); err != nil {
 		return nil, fmt.Errorf(
 			"mining genesis block: %w",
 			err,
