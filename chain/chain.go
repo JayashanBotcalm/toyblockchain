@@ -20,21 +20,11 @@ const DefaultDifficulty = 4
 
 const DefaultMaxTxPerBlock = 10
 
-// DifficultyRule records the height at which a difficulty becomes active.
-//
-// Example:
-//
-//	{StartHeight: 0, Difficulty: 4}
-//	{StartHeight: 5, Difficulty: 6}
-//
-// Blocks 0-4 use difficulty 4.
-// Block 5 and future blocks use difficulty 6.
 type DifficultyRule struct {
 	StartHeight int `json:"start_height"`
 	Difficulty  int `json:"difficulty"`
 }
 
-// Chain is the persisted blockchain state.
 type Chain struct {
 	Blocks             []*block.Block      `json:"blocks"`
 	Pending            []block.Transaction `json:"pending"`
@@ -42,7 +32,6 @@ type Chain struct {
 	MaxTxPerBlock      int                 `json:"max_tx_per_block"`
 }
 
-// New creates a new chain and mines its genesis block.
 func New(
 	ctx context.Context,
 	difficulty int,
@@ -79,17 +68,14 @@ func New(
 	}, nil
 }
 
-// Latest returns the blockchain tip.
 func (c *Chain) Latest() *block.Block {
 	return c.Blocks[len(c.Blocks)-1]
 }
 
-// Ledger derives the current ledger from confirmed blocks.
 func (c *Chain) Ledger() (*ledger.Ledger, error) {
 	return ledger.Rebuild(c.Blocks)
 }
 
-// ExpectedDifficulty returns the policy difficulty for a block height.
 func (c *Chain) ExpectedDifficulty(height int) int {
 	rules := append(
 		[]DifficultyRule(nil),
@@ -97,7 +83,8 @@ func (c *Chain) ExpectedDifficulty(height int) int {
 	)
 
 	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].StartHeight < rules[j].StartHeight
+		return rules[i].StartHeight <
+			rules[j].StartHeight
 	})
 
 	difficulty := DefaultDifficulty
@@ -113,11 +100,6 @@ func (c *Chain) ExpectedDifficulty(height int) int {
 	return difficulty
 }
 
-// SetDifficulty schedules a new difficulty from the next block.
-//
-// Existing blocks retain their original required difficulty.
-// The new value applies to the next block and all future blocks until
-// another difficulty rule is added.
 func (c *Chain) SetDifficulty(difficulty int) error {
 	if difficulty < 0 || difficulty > 64 {
 		return fmt.Errorf(
@@ -128,8 +110,11 @@ func (c *Chain) SetDifficulty(difficulty int) error {
 	startHeight := c.Latest().Height + 1
 
 	for index := range c.DifficultySchedule {
-		if c.DifficultySchedule[index].StartHeight == startHeight {
-			c.DifficultySchedule[index].Difficulty = difficulty
+		if c.DifficultySchedule[index].StartHeight ==
+			startHeight {
+			c.DifficultySchedule[index].Difficulty =
+				difficulty
+
 			return nil
 		}
 	}
@@ -145,17 +130,21 @@ func (c *Chain) SetDifficulty(difficulty int) error {
 	return nil
 }
 
-// AddTransaction validates confirmed and pending transaction state.
-func (c *Chain) AddTransaction(tx block.Transaction) error {
+func (c *Chain) AddTransaction(
+	tx block.Transaction,
+) error {
 	currentLedger, err := c.Ledger()
 	if err != nil {
-		return fmt.Errorf("rebuilding ledger: %w", err)
+		return fmt.Errorf(
+			"rebuilding ledger: %w",
+			err,
+		)
 	}
 
-	// Include pending transactions to prevent pending-pool double spending
-	// and duplicate nonces.
 	for _, pendingTransaction := range c.Pending {
-		if err := currentLedger.Apply(pendingTransaction); err != nil {
+		if err := currentLedger.Apply(
+			pendingTransaction,
+		); err != nil {
 			return fmt.Errorf(
 				"invalid pending pool: %w",
 				err,
@@ -163,7 +152,9 @@ func (c *Chain) AddTransaction(tx block.Transaction) error {
 		}
 	}
 
-	if err := currentLedger.ValidateTransaction(tx); err != nil {
+	if err := currentLedger.ValidateTransaction(
+		tx,
+	); err != nil {
 		return err
 	}
 
@@ -172,10 +163,6 @@ func (c *Chain) AddTransaction(tx block.Transaction) error {
 	return nil
 }
 
-// MineBlock mines a block using the policy difficulty expected at its height.
-//
-// Mining failure does not remove pending transactions and does not append
-// a partially mined block.
 func (c *Chain) MineBlock(
 	ctx context.Context,
 	limits block.MiningLimits,
@@ -200,7 +187,8 @@ func (c *Chain) MineBlock(
 	previousBlock := c.Latest()
 	newHeight := previousBlock.Height + 1
 
-	expectedDifficulty := c.ExpectedDifficulty(newHeight)
+	expectedDifficulty :=
+		c.ExpectedDifficulty(newHeight)
 
 	newBlock := block.NewBlock(
 		newHeight,
@@ -220,7 +208,6 @@ func (c *Chain) MineBlock(
 	return newBlock, result, nil
 }
 
-// ValidationError identifies the first invalid block.
 type ValidationError struct {
 	BlockHeight int
 	Reason      string
@@ -234,7 +221,6 @@ func (e *ValidationError) Error() string {
 	)
 }
 
-// Validate performs complete blockchain and ledger validation.
 func (c *Chain) Validate() error {
 	if len(c.Blocks) == 0 {
 		return &ValidationError{
@@ -246,20 +232,21 @@ func (c *Chain) Validate() error {
 	if len(c.DifficultySchedule) == 0 {
 		return &ValidationError{
 			BlockHeight: -1,
-			Reason:      "difficulty schedule is empty",
+			Reason: "difficulty schedule " +
+				"is empty",
 		}
 	}
 
 	currentLedger := ledger.New()
 
 	for index, currentBlock := range c.Blocks {
-		expectedDifficulty := c.ExpectedDifficulty(
-			currentBlock.Height,
-		)
+		expectedDifficulty :=
+			c.ExpectedDifficulty(
+				currentBlock.Height,
+			)
 
-		// This prevents an attacker from changing a block's recorded
-		// difficulty to a lower value.
-		if currentBlock.Difficulty != expectedDifficulty {
+		if currentBlock.Difficulty !=
+			expectedDifficulty {
 			return &ValidationError{
 				BlockHeight: currentBlock.Height,
 				Reason: fmt.Sprintf(
@@ -270,12 +257,29 @@ func (c *Chain) Validate() error {
 			}
 		}
 
-		recomputedHash := currentBlock.ComputeHash()
+		// Recalculate the Merkle root from the stored transactions.
+		expectedMerkleRoot :=
+			block.CalculateMerkleRoot(
+				currentBlock.Transactions,
+			)
+
+		if currentBlock.MerkleRoot !=
+			expectedMerkleRoot {
+			return &ValidationError{
+				BlockHeight: currentBlock.Height,
+				Reason: "stored Merkle root does " +
+					"not match transactions",
+			}
+		}
+
+		recomputedHash :=
+			currentBlock.ComputeHash()
 
 		if recomputedHash != currentBlock.Hash {
 			return &ValidationError{
 				BlockHeight: currentBlock.Height,
-				Reason:      "stored hash does not match recomputed hash",
+				Reason: "stored hash does not " +
+					"match recomputed hash",
 			}
 		}
 
@@ -285,7 +289,8 @@ func (c *Chain) Validate() error {
 		) {
 			return &ValidationError{
 				BlockHeight: currentBlock.Height,
-				Reason:      "hash does not meet expected difficulty",
+				Reason: "hash does not meet " +
+					"expected difficulty",
 			}
 		}
 
@@ -293,48 +298,53 @@ func (c *Chain) Validate() error {
 			if currentBlock.Height != 0 {
 				return &ValidationError{
 					BlockHeight: currentBlock.Height,
-					Reason:      "genesis height must be 0",
+					Reason: "genesis height " +
+						"must be 0",
 				}
 			}
 
-			if currentBlock.PrevHash != block.GenesisPrevHash {
+			if currentBlock.PrevHash !=
+				block.GenesisPrevHash {
 				return &ValidationError{
 					BlockHeight: currentBlock.Height,
-					Reason:      "wrong genesis previous hash",
+					Reason: "wrong genesis " +
+						"previous hash",
 				}
 			}
 		} else {
 			previousBlock := c.Blocks[index-1]
 
-			if currentBlock.Height != previousBlock.Height+1 {
+			if currentBlock.Height !=
+				previousBlock.Height+1 {
 				return &ValidationError{
 					BlockHeight: currentBlock.Height,
-					Reason:      "invalid height sequence",
+					Reason: "invalid height " +
+						"sequence",
 				}
 			}
 
-			if currentBlock.Timestamp < previousBlock.Timestamp {
+			if currentBlock.Timestamp <
+				previousBlock.Timestamp {
 				return &ValidationError{
 					BlockHeight: currentBlock.Height,
-					Reason:      "timestamp earlier than previous block",
+					Reason: "timestamp earlier " +
+						"than previous block",
 				}
 			}
 
-			if currentBlock.PrevHash != previousBlock.Hash {
+			if currentBlock.PrevHash !=
+				previousBlock.Hash {
 				return &ValidationError{
 					BlockHeight: currentBlock.Height,
-					Reason:      "previous hash link mismatch",
+					Reason: "previous hash " +
+						"link mismatch",
 				}
 			}
 		}
 
-		// Replaying transactions validates:
-		// - signatures,
-		// - ownership,
-		// - balances,
-		// - transaction nonces,
-		// - replay protection.
-		if err := currentLedger.ApplyBlock(currentBlock); err != nil {
+		if err := currentLedger.ApplyBlock(
+			currentBlock,
+		); err != nil {
 			return &ValidationError{
 				BlockHeight: currentBlock.Height,
 				Reason:      err.Error(),
@@ -345,22 +355,25 @@ func (c *Chain) Validate() error {
 	return nil
 }
 
-// Save performs an atomic JSON save:
-//
-//  1. write chain.json.tmp,
-//  2. flush it to disk,
-//  3. rename it over chain.json.
-//
-// This prevents partially written JSON files.
 func (c *Chain) Save(path string) error {
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := json.MarshalIndent(
+		c,
+		"",
+		"  ",
+	)
 	if err != nil {
-		return fmt.Errorf("marshalling chain: %w", err)
+		return fmt.Errorf(
+			"marshalling chain: %w",
+			err,
+		)
 	}
 
 	directory := filepath.Dir(path)
 
-	if err := os.MkdirAll(directory, 0755); err != nil {
+	if err := os.MkdirAll(
+		directory,
+		0755,
+	); err != nil {
 		return fmt.Errorf(
 			"creating chain directory: %w",
 			err,
@@ -371,7 +384,9 @@ func (c *Chain) Save(path string) error {
 
 	file, err := os.OpenFile(
 		temporaryPath,
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		os.O_CREATE|
+			os.O_WRONLY|
+			os.O_TRUNC,
 		0644,
 	)
 	if err != nil {
@@ -412,7 +427,10 @@ func (c *Chain) Save(path string) error {
 		)
 	}
 
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := os.Rename(
+		temporaryPath,
+		path,
+	); err != nil {
 		return fmt.Errorf(
 			"atomically replacing chain file: %w",
 			err,
@@ -424,7 +442,6 @@ func (c *Chain) Save(path string) error {
 	return nil
 }
 
-// Load reads and validates a saved blockchain.
 func Load(path string) (*Chain, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -433,7 +450,10 @@ func Load(path string) (*Chain, error) {
 
 	var loadedChain Chain
 
-	if err := json.Unmarshal(data, &loadedChain); err != nil {
+	if err := json.Unmarshal(
+		data,
+		&loadedChain,
+	); err != nil {
 		return nil, fmt.Errorf(
 			"parsing chain file: %w",
 			err,
@@ -450,13 +470,10 @@ func Load(path string) (*Chain, error) {
 	return &loadedChain, nil
 }
 
-// FileLock prevents two application processes from editing the same JSON
-// blockchain simultaneously.
 type FileLock struct {
 	path string
 }
 
-// AcquireFileLock waits for exclusive ownership of path+".lock".
 func AcquireFileLock(
 	path string,
 	timeout time.Duration,
@@ -467,7 +484,9 @@ func AcquireFileLock(
 	for {
 		file, err := os.OpenFile(
 			lockPath,
-			os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+			os.O_CREATE|
+				os.O_EXCL|
+				os.O_WRONLY,
 			0600,
 		)
 
@@ -502,7 +521,6 @@ func AcquireFileLock(
 	}
 }
 
-// Release releases the process-level JSON file lock.
 func (l *FileLock) Release() error {
 	if l == nil {
 		return nil

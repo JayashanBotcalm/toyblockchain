@@ -1,4 +1,3 @@
-// Command toyblockchain runs the Toy Blockchain CLI.
 package main
 
 import (
@@ -58,6 +57,12 @@ func main() {
 		"maximum nonce; 0 disables",
 	)
 
+	miningWorkers := flag.Int(
+		"mining-workers",
+		0,
+		"number of concurrent mining workers; 0 uses CPU count",
+	)
+
 	lockTimeout := flag.Duration(
 		"lock-timeout",
 		5*time.Second,
@@ -73,8 +78,6 @@ func main() {
 		fatal(err)
 	}
 
-	// Hold the lock for the complete application process.
-	// A second terminal cannot load stale state and overwrite this process.
 	fileLock, err := chain.AcquireFileLock(
 		*dataFile,
 		*lockTimeout,
@@ -97,6 +100,7 @@ func main() {
 	miningLimits := block.MiningLimits{
 		MaxAttempts: *maxAttempts,
 		MaxNonce:    *maxNonce,
+		Workers:     *miningWorkers,
 	}
 
 	currentChain, err := chain.Load(*dataFile)
@@ -124,14 +128,17 @@ func main() {
 			fatal(err)
 		}
 
-		if err := currentChain.Save(*dataFile); err != nil {
+		if err := currentChain.Save(
+			*dataFile,
+		); err != nil {
 			fatal(err)
 		}
 
 		fmt.Printf(
-			"Created new chain at %s (difficulty=%d).\n",
+			"Created new chain at %s (difficulty=%d, workers=%d).\n",
 			*dataFile,
 			*difficulty,
+			*miningWorkers,
 		)
 	} else {
 		fmt.Printf(
@@ -140,11 +147,10 @@ func main() {
 			len(currentChain.Blocks),
 		)
 
-		// The flag must not silently replace an existing chain's policy.
-		// Difficulty changes must use setdifficulty.
-		nextExpected := currentChain.ExpectedDifficulty(
-			currentChain.Latest().Height + 1,
-		)
+		nextExpected :=
+			currentChain.ExpectedDifficulty(
+				currentChain.Latest().Height + 1,
+			)
 
 		if *difficulty != chain.DefaultDifficulty &&
 			*difficulty != nextExpected {
@@ -165,24 +171,31 @@ func main() {
 		miningLimits,
 	)
 
-	// One-shot mode.
 	if flag.NArg() > 0 {
-		if err := application.Run(flag.Args()); err != nil {
+		if err := application.Run(
+			flag.Args(),
+		); err != nil {
 			fatal(err)
 		}
 
-		if err := currentChain.Save(*dataFile); err != nil {
+		if err := currentChain.Save(
+			*dataFile,
+		); err != nil {
 			fatal(err)
 		}
 
 		return
 	}
 
-	// Interactive mode.
 	application.RunREPL(os.Stdin)
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "Error:", err)
+	fmt.Fprintln(
+		os.Stderr,
+		"Error:",
+		err,
+	)
+
 	os.Exit(1)
 }

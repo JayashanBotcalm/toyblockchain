@@ -575,3 +575,54 @@ func TestMineBlockNoPending(t *testing.T) {
 		t.Fatal("expected error when mining without pending transactions")
 	}
 }
+func TestTamperedMerkleRootRejected(t *testing.T) {
+	testChain := buildHonestChain(t)
+
+	testChain.Blocks[2].MerkleRoot = "invalid-merkle-root"
+
+	err := testChain.Validate()
+	if err == nil {
+		t.Fatal("expected modified Merkle root to be rejected")
+	}
+
+	validationError, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf(
+			"expected ValidationError, got %T",
+			err,
+		)
+	}
+
+	if validationError.BlockHeight != 2 {
+		t.Fatalf(
+			"expected block 2 to fail, got block %d",
+			validationError.BlockHeight,
+		)
+	}
+}
+
+func TestTransactionTamperingBreaksMerkleRoot(t *testing.T) {
+	testChain := buildHonestChain(t)
+
+	testChain.Blocks[2].Transactions[0].Amount = 999999
+
+	err := testChain.Validate()
+	if err == nil {
+		t.Fatal("expected transaction tampering to be rejected")
+	}
+
+	validationError, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf(
+			"expected ValidationError, got %T",
+			err,
+		)
+	}
+
+	if validationError.BlockHeight != 2 {
+		t.Fatalf(
+			"expected block 2 to fail, got block %d",
+			validationError.BlockHeight,
+		)
+	}
+}

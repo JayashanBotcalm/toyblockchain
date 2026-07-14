@@ -42,20 +42,23 @@ func createSignedTransaction(
 }
 
 func sampleBlock() *Block {
-	return &Block{
-		Height:    1,
-		Timestamp: 1700000000,
-		Transactions: []Transaction{
-			{
-				Sender:    FaucetAccount,
-				Recipient: "alice",
-				Amount:    10,
-				Nonce:     0,
-			},
+	transactions := []Transaction{
+		{
+			Sender:    FaucetAccount,
+			Recipient: "alice",
+			Amount:    10,
+			Nonce:     0,
 		},
-		PrevHash:   "deadbeef",
-		Nonce:      42,
-		Difficulty: 2,
+	}
+
+	return &Block{
+		Height:       1,
+		Timestamp:    1700000000,
+		Transactions: transactions,
+		MerkleRoot:   CalculateMerkleRoot(transactions),
+		PrevHash:     "deadbeef",
+		Nonce:        42,
+		Difficulty:   2,
 	}
 }
 
@@ -91,6 +94,10 @@ func TestHashChangesWithContent(t *testing.T) {
 
 	changedTransaction := sampleBlock()
 	changedTransaction.Transactions[0].Amount = 999
+
+	changedTransaction.MerkleRoot = CalculateMerkleRoot(
+		changedTransaction.Transactions,
+	)
 
 	if changedTransaction.ComputeHash() == originalHash {
 		t.Fatal("hash should change when transaction amount changes")

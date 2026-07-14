@@ -413,6 +413,7 @@ func (c *CLI) cmdMine() error {
 	c.printf("  Nonce:      %d\n", result.Nonce)
 	c.printf("  Attempts:   %d\n", result.Attempts)
 	c.printf("  Difficulty: %d\n", result.Difficulty)
+	c.printf("  Workers:    %d\n", result.Workers)
 	c.printf("  Time:       %s\n", result.Elapsed)
 
 	return nil
