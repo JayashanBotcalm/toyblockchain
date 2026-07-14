@@ -69,6 +69,36 @@ func main() {
 		"time to wait for the chain file lock",
 	)
 
+	retargetEnabled := flag.Bool(
+		"retarget",
+		chain.DefaultRetargetConfig.Enabled,
+		"enable automatic difficulty retargeting for a new chain",
+	)
+
+	retargetInterval := flag.Int(
+		"retarget-interval",
+		chain.DefaultRetargetConfig.Interval,
+		"number of normal blocks in each retarget window",
+	)
+
+	targetBlockTime := flag.Duration(
+		"target-block-time",
+		time.Duration(chain.DefaultRetargetConfig.TargetBlockSeconds)*time.Second,
+		"target time for one block",
+	)
+
+	minDifficulty := flag.Int(
+		"min-difficulty",
+		chain.DefaultRetargetConfig.MinDifficulty,
+		"minimum automatic difficulty",
+	)
+
+	maxDifficulty := flag.Int(
+		"max-difficulty",
+		chain.DefaultRetargetConfig.MaxDifficulty,
+		"maximum automatic difficulty",
+	)
+
 	flag.Parse()
 
 	if err := os.MkdirAll(
@@ -103,6 +133,22 @@ func main() {
 		Workers:     *miningWorkers,
 	}
 
+	if *targetBlockTime < time.Second {
+		fatal(fmt.Errorf("target block time must be at least 1 second"))
+	}
+
+	retargetConfig := chain.RetargetConfig{
+		Enabled:            *retargetEnabled,
+		Interval:           *retargetInterval,
+		TargetBlockSeconds: int64((*targetBlockTime) / time.Second),
+		MinDifficulty:      *minDifficulty,
+		MaxDifficulty:      *maxDifficulty,
+	}
+
+	if err := retargetConfig.Validate(); err != nil {
+		fatal(fmt.Errorf("invalid retarget configuration: %w", err))
+	}
+
 	currentChain, err := chain.Load(*dataFile)
 
 	if err != nil {
@@ -115,11 +161,12 @@ func main() {
 			*miningTimeout,
 		)
 
-		currentChain, err = chain.New(
+		currentChain, err = chain.NewWithRetarget(
 			ctx,
 			*difficulty,
 			*maxTransactions,
 			miningLimits,
+			retargetConfig,
 		)
 
 		cancel()
@@ -135,10 +182,11 @@ func main() {
 		}
 
 		fmt.Printf(
-			"Created new chain at %s (difficulty=%d, workers=%d).\n",
+			"Created new chain at %s (difficulty=%d, workers=%d, retarget=%t).\n",
 			*dataFile,
 			*difficulty,
 			*miningWorkers,
+			retargetConfig.Enabled,
 		)
 	} else {
 		fmt.Printf(

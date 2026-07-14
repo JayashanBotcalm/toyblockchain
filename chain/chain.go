@@ -29,6 +29,7 @@ type Chain struct {
 	Blocks             []*block.Block      `json:"blocks"`
 	Pending            []block.Transaction `json:"pending"`
 	DifficultySchedule []DifficultyRule    `json:"difficulty_schedule"`
+	Retarget           RetargetConfig      `json:"retarget"`
 	MaxTxPerBlock      int                 `json:"max_tx_per_block"`
 }
 
@@ -38,12 +39,49 @@ func New(
 	maxTxPerBlock int,
 	limits block.MiningLimits,
 ) (*Chain, error) {
+	return NewWithRetarget(
+		ctx,
+		difficulty,
+		maxTxPerBlock,
+		limits,
+		DefaultRetargetConfig,
+	)
+}
+
+// NewWithRetarget creates a chain with an explicit automatic-retarget policy.
+func NewWithRetarget(
+	ctx context.Context,
+	difficulty int,
+	maxTxPerBlock int,
+	limits block.MiningLimits,
+	retarget RetargetConfig,
+) (*Chain, error) {
 	if difficulty < 0 {
 		difficulty = DefaultDifficulty
 	}
 
 	if maxTxPerBlock <= 0 {
 		maxTxPerBlock = DefaultMaxTxPerBlock
+	}
+
+	if err := retarget.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid retarget configuration: %w", err)
+	}
+
+	if difficulty < retarget.MinDifficulty {
+		return nil, fmt.Errorf(
+			"initial difficulty %d is below retarget minimum %d",
+			difficulty,
+			retarget.MinDifficulty,
+		)
+	}
+
+	if difficulty > retarget.MaxDifficulty {
+		return nil, fmt.Errorf(
+			"initial difficulty %d exceeds retarget maximum %d",
+			difficulty,
+			retarget.MaxDifficulty,
+		)
 	}
 
 	genesis, err := block.NewGenesisBlock(
@@ -64,6 +102,7 @@ func New(
 				Difficulty:  difficulty,
 			},
 		},
+		Retarget:      retarget,
 		MaxTxPerBlock: maxTxPerBlock,
 	}, nil
 }
@@ -77,27 +116,44 @@ func (c *Chain) Ledger() (*ledger.Ledger, error) {
 }
 
 func (c *Chain) ExpectedDifficulty(height int) int {
+	if height < 0 {
+		return DefaultDifficulty
+	}
+
 	rules := append(
 		[]DifficultyRule(nil),
 		c.DifficultySchedule...,
 	)
 
 	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].StartHeight <
-			rules[j].StartHeight
+		return rules[i].StartHeight < rules[j].StartHeight
 	})
 
-	difficulty := DefaultDifficulty
+	current := DefaultDifficulty
+	ruleIndex := 0
 
-	for _, rule := range rules {
-		if rule.StartHeight > height {
-			break
-		}
-
-		difficulty = rule.Difficulty
+	for ruleIndex < len(rules) && rules[ruleIndex].StartHeight <= 0 {
+		current = rules[ruleIndex].Difficulty
+		ruleIndex++
 	}
 
-	return difficulty
+	for blockHeight := 1; blockHeight <= height; blockHeight++ {
+		manualRuleApplied := false
+
+		for ruleIndex < len(rules) &&
+			rules[ruleIndex].StartHeight == blockHeight {
+			current = rules[ruleIndex].Difficulty
+			manualRuleApplied = true
+			ruleIndex++
+		}
+
+		// An explicit manual rule at this exact height takes priority.
+		if !manualRuleApplied && c.shouldRetarget(blockHeight) {
+			current = c.retargetDifficulty(blockHeight, current)
+		}
+	}
+
+	return current
 }
 
 func (c *Chain) SetDifficulty(difficulty int) error {
@@ -234,6 +290,13 @@ func (c *Chain) Validate() error {
 			BlockHeight: -1,
 			Reason: "difficulty schedule " +
 				"is empty",
+		}
+	}
+
+	if err := c.Retarget.Validate(); err != nil {
+		return &ValidationError{
+			BlockHeight: -1,
+			Reason:      "invalid retarget configuration: " + err.Error(),
 		}
 	}
 

@@ -154,6 +154,13 @@ func (c *CLI) Run(args []string) error {
 		c.cmdPolicy()
 		return nil
 
+	case "retarget":
+		c.cmdRetarget()
+		return nil
+
+	case "retarget-config":
+		return c.cmdRetargetConfig(remainingArgs)
+
 	case "print":
 		c.cmdPrint()
 		return nil
@@ -195,6 +202,9 @@ func (c *CLI) help() {
   mine                                 Mine pending transactions
   setdifficulty <n>                    Apply n from the next block onward
   policy                               Show the difficulty schedule
+  retarget                             Show automatic retarget settings
+  retarget-config <on|off> <interval> <target-seconds> <min> <max>
+                                        Configure retargeting before block 1
   print                                Print the full blockchain
   validate                             Validate the complete blockchain
   balances                             Show all account balances
@@ -450,6 +460,85 @@ func (c *CLI) cmdPolicy() {
 			rule.Difficulty,
 		)
 	}
+}
+
+func (c *CLI) cmdRetarget() {
+	config := c.Chain.Retarget
+
+	c.printf("Automatic difficulty retargeting:\n")
+	c.printf("  Enabled:              %t\n", config.Enabled)
+	c.printf("  Interval:             %d blocks\n", config.Interval)
+	c.printf("  Target block time:    %d seconds\n", config.TargetBlockSeconds)
+	c.printf("  Minimum difficulty:   %d\n", config.MinDifficulty)
+	c.printf("  Maximum difficulty:   %d\n", config.MaxDifficulty)
+
+	nextHeight := c.Chain.NextRetargetHeight()
+	if nextHeight < 0 {
+		c.printf("  Next retarget height: disabled\n")
+	} else {
+		c.printf("  Next retarget height: %d\n", nextHeight)
+	}
+
+	nextBlockHeight := c.Chain.Latest().Height + 1
+	c.printf(
+		"  Next block difficulty: %d\n",
+		c.Chain.ExpectedDifficulty(nextBlockHeight),
+	)
+}
+
+func (c *CLI) cmdRetargetConfig(args []string) error {
+	if len(args) != 5 {
+		return fmt.Errorf(
+			"usage: retarget-config <on|off> <interval> <target-seconds> <min> <max>",
+		)
+	}
+
+	var enabled bool
+	switch strings.ToLower(args[0]) {
+	case "on", "true", "enabled":
+		enabled = true
+	case "off", "false", "disabled":
+		enabled = false
+	default:
+		return fmt.Errorf("first value must be on or off")
+	}
+
+	interval, err := strconv.Atoi(args[1])
+	if err != nil {
+		return fmt.Errorf("invalid retarget interval: %w", err)
+	}
+
+	targetSeconds, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid target block seconds: %w", err)
+	}
+
+	minimum, err := strconv.Atoi(args[3])
+	if err != nil {
+		return fmt.Errorf("invalid minimum difficulty: %w", err)
+	}
+
+	maximum, err := strconv.Atoi(args[4])
+	if err != nil {
+		return fmt.Errorf("invalid maximum difficulty: %w", err)
+	}
+
+	config := chain.RetargetConfig{
+		Enabled:            enabled,
+		Interval:           interval,
+		TargetBlockSeconds: targetSeconds,
+		MinDifficulty:      minimum,
+		MaxDifficulty:      maximum,
+	}
+
+	if err := c.Chain.ConfigureRetarget(config); err != nil {
+		return err
+	}
+
+	c.printf("Retarget configuration updated.\n")
+	c.cmdRetarget()
+
+	return nil
 }
 
 func (c *CLI) cmdPrint() {
